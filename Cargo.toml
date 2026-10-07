@@ -1,0 +1,11 @@
+[package]
+name = "lurkmoar"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+description = "Tiny change-driven Prometheus metrics push client with bounded outage spooling"
+repository = "https://github.com/codeandsolder/lurkmoar-rs"
+
+[dependencies]
+flate2 = "1"
+ureq = "3"
