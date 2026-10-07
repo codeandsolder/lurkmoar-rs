@@ -293,7 +293,7 @@ fn encode_batch(
                     if line.is_empty() || line.starts_with('#') {
                         continue;
                     }
-                    let Some(space) = line.find(char::is_whitespace) else {
+                    let Some(space) = sample_value_separator(line) else {
                         continue;
                     };
                     let metric = add_labels(&line[..space], static_labels);
@@ -337,6 +337,31 @@ fn encode_batch(
     let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
     encoder.write_all(text.as_bytes())?;
     encoder.finish().map_err(Error::Io)
+}
+
+fn sample_value_separator(line: &str) -> Option<usize> {
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, byte) in line.bytes().enumerate() {
+        if quoted {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match byte {
+                b'\\' => escaped = true,
+                b'"' => quoted = false,
+                _ => {}
+            }
+            continue;
+        }
+        match byte {
+            b'"' => quoted = true,
+            b' ' | b'\t' => return Some(index),
+            _ => {}
+        }
+    }
+    None
 }
 
 fn add_labels(metric: &str, labels: &[(String, String)]) -> String {
@@ -392,7 +417,7 @@ fn update_spool_bytes(health: &Health, directory: Option<&std::path::Path>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Payload, add_labels, encode_batch};
+    use super::{Payload, add_labels, encode_batch, sample_value_separator};
     use flate2::read::GzDecoder;
     use std::io::Read;
 
@@ -423,5 +448,32 @@ mod tests {
             add_labels("x", &[("a".into(), "q\"\\\n".into())]),
             "x{a=\"q\\\"\\\\\\n\"}"
         );
+    }
+    #[test]
+    fn sample_separator_ignores_whitespace_inside_labels() {
+        let line = r#"x{a="hello world",b="q\" z"} 1"#;
+        assert_eq!(sample_value_separator(line), line.rfind(" 1"));
+        assert_eq!(sample_value_separator("plain\t2"), Some(5));
+    }
+
+    #[test]
+    fn text_labels_with_spaces_and_escapes_survive_timestamping()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let payload = Payload::PrometheusText {
+            text: concat!(
+                "uname_info{version=\"#1 SMP PREEMPT_DYNAMIC Thu Oct 1\",note=\"a\\\" b\\\\ c\"} 1\n",
+                "reason_info{reason=\"multiple input files\"} 3\n",
+            ).into(),
+            timestamp_ms: 1_234,
+        };
+        let gzip = encode_batch(&[payload], &[("instance".into(), "host-a".into())])?;
+        assert_eq!(
+            decode_gzip(&gzip)?,
+            concat!(
+                "uname_info{version=\"#1 SMP PREEMPT_DYNAMIC Thu Oct 1\",note=\"a\\\" b\\\\ c\",instance=\"host-a\"} 1 1234\n",
+                "reason_info{reason=\"multiple input files\",instance=\"host-a\"} 3 1234\n",
+            )
+        );
+        Ok(())
     }
 }
