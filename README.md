@@ -40,7 +40,7 @@ Normal operation does not write metric data to disk.
 6. Recovery replays spool files oldest-first, then RAM.
 7. Ambiguous HTTP acknowledgement can replay a batch; configure a tiny backend dedup interval if duplicate timestamps matter (for Liberta/VictoriaMetrics we use 1 ms).
 
-`Client::health()` and `Client::health_prometheus(prefix)` expose attempts, failures, dropped batches, RAM backlog, spool bytes, and last successful delivery time for application debug endpoints/dashboards.
+`Client::health()` and `Client::health_prometheus(prefix)` expose attempts/failures, sent batches and samples, compressed/uncompressed byte totals, encode totals, replay count, cumulative and most-recent HTTP latency, RAM backlog, spool bytes, oldest pending age, dropped batches, and last successful delivery time. This makes compression efficiency, retry/replay behavior and delivery lag visible without each application reinventing transport instrumentation.
 
 ## Scope
 
