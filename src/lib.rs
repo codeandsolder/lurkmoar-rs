@@ -58,8 +58,19 @@ pub struct HealthSnapshot {
     pub attempts_total: u64,
     pub failures_total: u64,
     pub dropped_batches_total: u64,
+    pub sent_batches_total: u64,
+    pub sent_samples_total: u64,
+    pub sent_compressed_bytes_total: u64,
+    pub sent_uncompressed_bytes_total: u64,
+    pub replayed_batches_total: u64,
+    pub encoded_samples_total: u64,
+    pub encoded_compressed_bytes_total: u64,
+    pub encoded_uncompressed_bytes_total: u64,
+    pub request_duration_microseconds_total: u64,
+    pub last_request_duration_microseconds: u64,
     pub pending_batches: usize,
     pub spool_bytes: u64,
+    pub oldest_pending_age_seconds: u64,
     pub last_success_unixtime: u64,
 }
 
@@ -68,19 +79,56 @@ pub(crate) struct Health {
     pub(crate) attempts_total: AtomicU64,
     pub(crate) failures_total: AtomicU64,
     pub(crate) dropped_batches_total: AtomicU64,
+    pub(crate) sent_batches_total: AtomicU64,
+    pub(crate) sent_samples_total: AtomicU64,
+    pub(crate) sent_compressed_bytes_total: AtomicU64,
+    pub(crate) sent_uncompressed_bytes_total: AtomicU64,
+    pub(crate) replayed_batches_total: AtomicU64,
+    pub(crate) encoded_samples_total: AtomicU64,
+    pub(crate) encoded_compressed_bytes_total: AtomicU64,
+    pub(crate) encoded_uncompressed_bytes_total: AtomicU64,
+    pub(crate) request_duration_microseconds_total: AtomicU64,
+    pub(crate) last_request_duration_microseconds: AtomicU64,
     pub(crate) pending_batches: AtomicUsize,
     pub(crate) spool_bytes: AtomicU64,
+    pub(crate) oldest_pending_unixtime: AtomicU64,
     pub(crate) last_success_unixtime: AtomicU64,
 }
 
 impl Health {
     fn snapshot(&self) -> HealthSnapshot {
+        let oldest_pending = self.oldest_pending_unixtime.load(Ordering::Relaxed);
         HealthSnapshot {
             attempts_total: self.attempts_total.load(Ordering::Relaxed),
             failures_total: self.failures_total.load(Ordering::Relaxed),
             dropped_batches_total: self.dropped_batches_total.load(Ordering::Relaxed),
+            sent_batches_total: self.sent_batches_total.load(Ordering::Relaxed),
+            sent_samples_total: self.sent_samples_total.load(Ordering::Relaxed),
+            sent_compressed_bytes_total: self.sent_compressed_bytes_total.load(Ordering::Relaxed),
+            sent_uncompressed_bytes_total: self
+                .sent_uncompressed_bytes_total
+                .load(Ordering::Relaxed),
+            replayed_batches_total: self.replayed_batches_total.load(Ordering::Relaxed),
+            encoded_samples_total: self.encoded_samples_total.load(Ordering::Relaxed),
+            encoded_compressed_bytes_total: self
+                .encoded_compressed_bytes_total
+                .load(Ordering::Relaxed),
+            encoded_uncompressed_bytes_total: self
+                .encoded_uncompressed_bytes_total
+                .load(Ordering::Relaxed),
+            request_duration_microseconds_total: self
+                .request_duration_microseconds_total
+                .load(Ordering::Relaxed),
+            last_request_duration_microseconds: self
+                .last_request_duration_microseconds
+                .load(Ordering::Relaxed),
             pending_batches: self.pending_batches.load(Ordering::Relaxed),
             spool_bytes: self.spool_bytes.load(Ordering::Relaxed),
+            oldest_pending_age_seconds: if oldest_pending == 0 {
+                0
+            } else {
+                unix_seconds().saturating_sub(oldest_pending)
+            },
             last_success_unixtime: self.last_success_unixtime.load(Ordering::Relaxed),
         }
     }
@@ -273,8 +321,19 @@ impl Client {
                 "{}_attempts_total {}\n",
                 "{}_failures_total {}\n",
                 "{}_dropped_batches_total {}\n",
+                "{}_sent_batches_total {}\n",
+                "{}_sent_samples_total {}\n",
+                "{}_sent_compressed_bytes_total {}\n",
+                "{}_sent_uncompressed_bytes_total {}\n",
+                "{}_replayed_batches_total {}\n",
+                "{}_encoded_samples_total {}\n",
+                "{}_encoded_compressed_bytes_total {}\n",
+                "{}_encoded_uncompressed_bytes_total {}\n",
+                "{}_request_duration_microseconds_total {}\n",
+                "{}_last_request_duration_microseconds {}\n",
                 "{}_pending_batches {}\n",
                 "{}_spool_bytes {}\n",
+                "{}_oldest_pending_age_seconds {}\n",
                 "{}_last_success_unixtime {}\n"
             ),
             prefix,
@@ -284,9 +343,31 @@ impl Client {
             prefix,
             health.dropped_batches_total,
             prefix,
+            health.sent_batches_total,
+            prefix,
+            health.sent_samples_total,
+            prefix,
+            health.sent_compressed_bytes_total,
+            prefix,
+            health.sent_uncompressed_bytes_total,
+            prefix,
+            health.replayed_batches_total,
+            prefix,
+            health.encoded_samples_total,
+            prefix,
+            health.encoded_compressed_bytes_total,
+            prefix,
+            health.encoded_uncompressed_bytes_total,
+            prefix,
+            health.request_duration_microseconds_total,
+            prefix,
+            health.last_request_duration_microseconds,
+            prefix,
             health.pending_batches,
             prefix,
             health.spool_bytes,
+            prefix,
+            health.oldest_pending_age_seconds,
             prefix,
             health.last_success_unixtime,
         )

@@ -67,6 +67,14 @@ fn change_is_sent_without_a_batch_timer() -> Result<(), Box<dyn std::error::Erro
 
     let body = receiver.recv_timeout(Duration::from_millis(500))??;
     assert!(body.starts_with("demo_state{instance=\"test-host\",slot=\"7\"} 3 "));
+    client.flush()?;
+    let health = client.health();
+    assert_eq!(health.sent_batches_total, 1);
+    assert_eq!(health.sent_samples_total, 1);
+    assert!(health.sent_compressed_bytes_total > 0);
+    assert!(health.sent_uncompressed_bytes_total > 0);
+    assert_eq!(health.encoded_samples_total, 1);
+    assert!(health.last_request_duration_microseconds > 0);
     assert!(!gauge.set(3.0)?);
     server.join().map_err(|_| "server thread panicked")?;
     Ok(())
@@ -100,6 +108,7 @@ fn outage_spills_then_replays() -> Result<(), Box<dyn std::error::Error + Send +
     }
     assert!(client.health().failures_total > 0);
     assert!(client.health().spool_bytes > 0);
+    assert!(client.health().oldest_pending_age_seconds <= 2);
 
     let listener = TcpListener::bind(address)?;
     let (sender, receiver) = mpsc::sync_channel(1);
@@ -113,8 +122,12 @@ fn outage_spills_then_replays() -> Result<(), Box<dyn std::error::Error + Send +
     client.flush()?;
     let body = receiver.recv_timeout(Duration::from_secs(1))??;
     assert!(body.starts_with("rare_change 1 "));
-    assert_eq!(client.health().spool_bytes, 0);
-    assert_eq!(client.health().pending_batches, 0);
+    let health = client.health();
+    assert_eq!(health.spool_bytes, 0);
+    assert_eq!(health.pending_batches, 0);
+    assert_eq!(health.oldest_pending_age_seconds, 0);
+    assert_eq!(health.replayed_batches_total, 1);
+    assert_eq!(health.sent_samples_total, 1);
     server.join().map_err(|_| "server thread panicked")?;
     std::fs::remove_dir_all(&spool_dir)?;
     Ok(())
