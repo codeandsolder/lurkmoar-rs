@@ -272,7 +272,7 @@ fn spill_pending(
     let existing = spool::size(directory)?;
     let encoded_len = u64::try_from(encoded.len()).unwrap_or(u64::MAX);
     if existing.saturating_add(encoded_len) > config.spool_max_bytes {
-        health.dropped_batches_total.fetch_add(
+        let _ = health.dropped_batches_total.fetch_add(
             u64::try_from(pending.len()).unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
@@ -297,7 +297,7 @@ fn send_gzip(
     samples: u64,
     replayed: bool,
 ) -> Result<(), Error> {
-    health.attempts_total.fetch_add(1, Ordering::Relaxed);
+    let _ = health.attempts_total.fetch_add(1, Ordering::Relaxed);
     let started = Instant::now();
     let result = agent
         .post(endpoint)
@@ -305,7 +305,7 @@ fn send_gzip(
         .header("Content-Encoding", "gzip")
         .send(body);
     let micros = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
-    health
+    let _ = health
         .request_duration_microseconds_total
         .fetch_add(micros, Ordering::Relaxed);
     health
@@ -313,19 +313,19 @@ fn send_gzip(
         .store(micros, Ordering::Relaxed);
     match result {
         Ok(_) => {
-            health.sent_batches_total.fetch_add(1, Ordering::Relaxed);
-            health
+            let _ = health.sent_batches_total.fetch_add(1, Ordering::Relaxed);
+            let _ = health
                 .sent_samples_total
                 .fetch_add(samples, Ordering::Relaxed);
-            health.sent_compressed_bytes_total.fetch_add(
+            let _ = health.sent_compressed_bytes_total.fetch_add(
                 u64::try_from(body.len()).unwrap_or(u64::MAX),
                 Ordering::Relaxed,
             );
-            health
+            let _ = health
                 .sent_uncompressed_bytes_total
                 .fetch_add(uncompressed_bytes, Ordering::Relaxed);
             if replayed {
-                health
+                let _ = health
                     .replayed_batches_total
                     .fetch_add(1, Ordering::Relaxed);
             }
@@ -335,21 +335,21 @@ fn send_gzip(
             Ok(())
         }
         Err(error) => {
-            health.failures_total.fetch_add(1, Ordering::Relaxed);
+            let _ = health.failures_total.fetch_add(1, Ordering::Relaxed);
             Err(Error::Delivery(error.to_string()))
         }
     }
 }
 
 fn record_encoded(health: &Health, batch: &Batch) {
-    health
+    let _ = health
         .encoded_samples_total
         .fetch_add(batch.samples, Ordering::Relaxed);
-    health.encoded_compressed_bytes_total.fetch_add(
+    let _ = health.encoded_compressed_bytes_total.fetch_add(
         u64::try_from(batch.gzip.len()).unwrap_or(u64::MAX),
         Ordering::Relaxed,
     );
-    health
+    let _ = health
         .encoded_uncompressed_bytes_total
         .fetch_add(batch.uncompressed_bytes, Ordering::Relaxed);
 }
@@ -357,8 +357,8 @@ fn record_encoded(health: &Health, batch: &Batch) {
 fn inspect_gzip(body: &[u8]) -> Result<(u64, u64), Error> {
     let mut decoder = GzDecoder::new(body);
     let mut text = String::new();
-    decoder.read_to_string(&mut text).map_err(Error::Io)?;
-    let bytes = u64::try_from(text.len()).unwrap_or(u64::MAX);
+    let bytes_read = decoder.read_to_string(&mut text).map_err(Error::Io)?;
+    let bytes = u64::try_from(bytes_read).unwrap_or(u64::MAX);
     let samples =
         u64::try_from(text.lines().filter(|line| !line.is_empty()).count()).unwrap_or(u64::MAX);
     Ok((bytes, samples))
@@ -534,7 +534,7 @@ mod tests {
     fn decode_gzip(bytes: &[u8]) -> Result<String, Box<dyn std::error::Error>> {
         let mut decoder = GzDecoder::new(bytes);
         let mut text = String::new();
-        decoder.read_to_string(&mut text)?;
+        let _ = decoder.read_to_string(&mut text)?;
         Ok(text)
     }
 

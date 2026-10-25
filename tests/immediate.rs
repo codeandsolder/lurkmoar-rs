@@ -40,7 +40,7 @@ fn read_request(mut stream: TcpStream) -> Result<String, Box<dyn std::error::Err
     let body = &received[header_end..header_end + content_length];
     let mut decoder = GzDecoder::new(body);
     let mut text = String::new();
-    decoder.read_to_string(&mut text)?;
+    let _ = decoder.read_to_string(&mut text)?;
     stream
         .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")?;
     Ok(text)
