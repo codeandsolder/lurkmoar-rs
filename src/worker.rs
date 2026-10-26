@@ -185,7 +185,10 @@ fn run(receiver: &mpsc::Receiver<Command>, health: &Health, config: &Config) {
                 offline_since = None;
                 spill_deadline = None;
             } else {
-                retry_deadline = now + config.retry_interval;
+                // Measure backoff from completion of the failed attempt. Using the
+                // pre-attempt timestamp can collapse the delay to zero when the
+                // request itself takes at least one retry interval.
+                retry_deadline = Instant::now() + config.retry_interval;
             }
         }
     }

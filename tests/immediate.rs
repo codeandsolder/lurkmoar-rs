@@ -132,3 +132,81 @@ fn outage_spills_then_replays() -> Result<(), Box<dyn std::error::Error + Send +
     std::fs::remove_dir_all(&spool_dir)?;
     Ok(())
 }
+
+fn consume_request(stream: &mut TcpStream) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    let mut received = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    let header_end = loop {
+        let count = stream.read(&mut buffer)?;
+        if count == 0 {
+            return Err("connection closed before headers completed".into());
+        }
+        received.extend_from_slice(&buffer[..count]);
+        if let Some(position) = received.windows(4).position(|window| window == b"\r\n\r\n") {
+            break position + 4;
+        }
+    };
+    let headers = std::str::from_utf8(&received[..header_end])?;
+    let content_length = headers
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })
+        .ok_or("missing content-length")?;
+    while received.len() - header_end < content_length {
+        let count = stream.read(&mut buffer)?;
+        if count == 0 {
+            return Err("connection closed before body completed".into());
+        }
+        received.extend_from_slice(&buffer[..count]);
+    }
+    Ok(())
+}
+
+#[test]
+fn retry_interval_starts_after_failed_attempt_finishes()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let server = thread::spawn(
+        move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            let failure = b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+            let (mut first, _) = listener.accept()?;
+            consume_request(&mut first)?;
+            first.write_all(failure)?;
+
+            let (mut second, _) = listener.accept()?;
+            consume_request(&mut second)?;
+            thread::sleep(Duration::from_millis(150));
+            second.write_all(failure)?;
+            let second_finished = std::time::Instant::now();
+
+            let (mut third, _) = listener.accept()?;
+            let gap = second_finished.elapsed();
+            consume_request(&mut third)?;
+            third.write_all(failure)?;
+            sender.send(gap)?;
+            Ok(())
+        },
+    );
+
+    let client = ClientBuilder::new(format!("http://{address}/import"))
+        .retry_interval(Duration::from_millis(100))
+        .timeout(Duration::from_secs(1))
+        .build()?;
+    client.sample("retry_test", 1.0, std::iter::empty::<(&str, &str)>())?;
+
+    let gap = receiver.recv_timeout(Duration::from_secs(2))?;
+    assert!(
+        gap >= Duration::from_millis(75),
+        "retry started only {gap:?} after the previous failed attempt completed"
+    );
+    server.join().map_err(|_| "server thread panicked")??;
+    Ok(())
+}
