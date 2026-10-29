@@ -114,14 +114,14 @@ fn run(receiver: &mpsc::Receiver<Command>, health: &Health, config: &Config) {
                             ) {
                                 pending.push_back(batch);
                                 set_pending(health, pending.len());
-                                eprintln!("lurkmoar: delivery failed: {error}");
+                                tracing::warn!("lurkmoar: delivery failed: {error}");
                                 let now = Instant::now();
                                 offline_since = Some(now);
                                 retry_deadline = now + config.retry_interval;
                                 spill_deadline = Some(now + config.spill_after);
                             }
                         }
-                        Err(error) => eprintln!("lurkmoar: cannot encode metrics: {error}"),
+                        Err(error) => tracing::warn!("lurkmoar: cannot encode metrics: {error}"),
                     }
                     for waiter in flush_waiters {
                         let flush_result = attempt_delivery(&agent, health, config, &mut pending);
@@ -155,7 +155,7 @@ fn run(receiver: &mpsc::Receiver<Command>, health: &Health, config: &Config) {
                         pending.push_back(batch);
                         set_pending(health, pending.len());
                     }
-                    Err(error) => eprintln!("lurkmoar: cannot encode metrics: {error}"),
+                    Err(error) => tracing::warn!("lurkmoar: cannot encode metrics: {error}"),
                 }
             }
             Ok(Command::Flush(waiter)) => {
@@ -176,7 +176,7 @@ fn run(receiver: &mpsc::Receiver<Command>, health: &Health, config: &Config) {
         let now = Instant::now();
         if spill_deadline.is_some_and(|deadline| now >= deadline) {
             if let Err(error) = spill_pending(health, config, &mut pending) {
-                eprintln!("lurkmoar: spool write failed: {error}");
+                tracing::warn!("lurkmoar: spool write failed: {error}");
             }
             spill_deadline = Some(now + config.spill_after);
         }
@@ -198,7 +198,7 @@ fn shutdown(health: &Health, config: &Config, pending: &mut VecDeque<Batch>) {
     if !pending.is_empty()
         && let Err(error) = spill_pending(health, config, pending)
     {
-        eprintln!("lurkmoar: shutdown spool failed: {error}");
+        tracing::warn!("lurkmoar: shutdown spool failed: {error}");
     }
 }
 
@@ -234,7 +234,7 @@ fn replay_spool(agent: &ureq::Agent, health: &Health, config: &Config) -> Result
         let batches = match spool::decode(&contents) {
             Ok(batches) => batches,
             Err(error) => {
-                eprintln!(
+                tracing::warn!(
                     "lurkmoar: discarding corrupt spool {}: {error}",
                     path.display()
                 );

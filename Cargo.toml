@@ -9,6 +9,7 @@ repository = "https://github.com/codeandsolder/lurkmoar-rs"
 [dependencies]
 flate2 = "1"
 ureq = "3"
+tracing = "0.1"
 
 [lints.rust]
 unsafe_code = "forbid"
