@@ -1,4 +1,6 @@
+use flate2::Compression;
 use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
 use lurkmoar::ClientBuilder;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -208,5 +210,59 @@ fn retry_interval_starts_after_failed_attempt_finishes()
         "retry started only {gap:?} after the previous failed attempt completed"
     );
     server.join().map_err(|_| "server thread panicked")??;
+    Ok(())
+}
+
+#[test]
+fn historical_backlog_replays_in_bounded_multi_file_requests()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let spool_dir = std::env::temp_dir().join(format!(
+        "lurkmoar-backlog-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&spool_dir)?;
+    for index in 0..130_u32 {
+        let mut gzip = GzEncoder::new(Vec::new(), Compression::fast());
+        gzip.write_all(
+            format!("replay_marker{{part=\"{index}\"}} {index} 1794500000000\n").as_bytes(),
+        )?;
+        let compressed = gzip.finish()?;
+        let mut contents = b"LURKMR01".to_vec();
+        contents.extend_from_slice(&u32::try_from(compressed.len())?.to_le_bytes());
+        contents.extend_from_slice(&compressed);
+        std::fs::write(spool_dir.join(format!("{index:020}.spool")), contents)?;
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let server = thread::spawn(move || {
+        let mut bodies = Vec::new();
+        for _ in 0..2 {
+            let (stream, _) = listener.accept()?;
+            bodies.push(read_request(stream)?);
+        }
+        sender.send(bodies)?;
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+    });
+    let client = ClientBuilder::new(format!("http://{address}/import"))
+        .spool(&spool_dir, 1024 * 1024)
+        .build()?;
+    client.flush()?;
+    let bodies = receiver.recv_timeout(Duration::from_secs(5))?;
+    assert_eq!(bodies.len(), 2);
+    assert_eq!(bodies[0].lines().count(), 128);
+    assert_eq!(bodies[1].lines().count(), 2);
+    assert!(bodies[0].contains("replay_marker{part=\"0\"} 0"));
+    assert!(bodies[1].contains("replay_marker{part=\"129\"} 129"));
+    assert_eq!(client.health().sent_samples_total, 130);
+    assert_eq!(client.health().replayed_batches_total, 2);
+    assert_eq!(client.health().spool_bytes, 0);
+    assert_eq!(std::fs::read_dir(&spool_dir)?.count(), 0);
+    server.join().map_err(|_| "server thread panicked")??;
+    std::fs::remove_dir(&spool_dir)?;
     Ok(())
 }

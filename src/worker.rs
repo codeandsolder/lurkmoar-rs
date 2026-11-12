@@ -225,10 +225,53 @@ fn attempt_delivery(
     Ok(())
 }
 
+// Batch persisted frames into a bounded number of HTTP requests. Replaying
+// one small historical frame per HTTP request can take minutes after an
+// outage, starving fresh sccache_info heartbeats and breaking health checks.
+// Bound *both* number of spool files and uncompressed payload size.
+const REPLAY_MAX_FILES_PER_REQUEST: usize = 128;
+const REPLAY_MAX_UNCOMPRESSED_BYTES: usize = 512 * 1024;
+
+/// Submit all fully buffered files as one gzip document. On any delivery
+/// failure, leave every file intact so the next attempt can replay it.
+fn send_replay_files(
+    agent: &ureq::Agent,
+    health: &Health,
+    config: &Config,
+    paths: &mut Vec<PathBuf>,
+    text: &mut String,
+    samples: &mut u64,
+) -> Result<(), Error> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+    encoder.write_all(text.as_bytes())?;
+    let payload = encoder.finish()?;
+    send_gzip(
+        agent,
+        health,
+        &config.endpoint,
+        &payload,
+        u64::try_from(text.len()).unwrap_or(u64::MAX),
+        *samples,
+        true,
+    )?;
+    for path in paths.drain(..) {
+        fs::remove_file(path)?;
+    }
+    text.clear();
+    *samples = 0;
+    Ok(())
+}
+
 fn replay_spool(agent: &ureq::Agent, health: &Health, config: &Config) -> Result<(), Error> {
     let Some(directory) = config.spool_dir.as_deref() else {
         return Ok(());
     };
+    let mut paths = Vec::new();
+    let mut text = String::new();
+    let mut samples = 0_u64;
     for path in spool::files(directory)? {
         let contents = fs::read(&path)?;
         let batches = match spool::decode(&contents) {
@@ -242,20 +285,33 @@ fn replay_spool(agent: &ureq::Agent, health: &Health, config: &Config) -> Result
                 continue;
             }
         };
+        let mut file_text = String::new();
+        let mut file_samples = 0_u64;
         for batch in batches {
-            let (uncompressed_bytes, samples) = inspect_gzip(batch)?;
-            send_gzip(
-                agent,
-                health,
-                &config.endpoint,
-                batch,
-                uncompressed_bytes,
-                samples,
-                true,
-            )?;
+            let mut decoder = GzDecoder::new(batch);
+            let _ = decoder.read_to_string(&mut file_text)?;
         }
-        fs::remove_file(&path)?;
+        for line in file_text.lines() {
+            if !line.is_empty() {
+                file_samples = file_samples.saturating_add(1);
+            }
+        }
+        if !paths.is_empty()
+            && (paths.len() >= REPLAY_MAX_FILES_PER_REQUEST
+                || text.len().saturating_add(file_text.len()) > REPLAY_MAX_UNCOMPRESSED_BYTES)
+        {
+            send_replay_files(agent, health, config, &mut paths, &mut text, &mut samples)?;
+        }
+        text.push_str(&file_text);
+        samples = samples.saturating_add(file_samples);
+        paths.push(path);
+        if paths.len() >= REPLAY_MAX_FILES_PER_REQUEST
+            || text.len() >= REPLAY_MAX_UNCOMPRESSED_BYTES
+        {
+            send_replay_files(agent, health, config, &mut paths, &mut text, &mut samples)?;
+        }
     }
+    send_replay_files(agent, health, config, &mut paths, &mut text, &mut samples)?;
     update_spool_bytes(health, Some(directory));
     Ok(())
 }
@@ -355,16 +411,6 @@ fn record_encoded(health: &Health, batch: &Batch) {
     let _ = health
         .encoded_uncompressed_bytes_total
         .fetch_add(batch.uncompressed_bytes, Ordering::Relaxed);
-}
-
-fn inspect_gzip(body: &[u8]) -> Result<(u64, u64), Error> {
-    let mut decoder = GzDecoder::new(body);
-    let mut text = String::new();
-    let bytes_read = decoder.read_to_string(&mut text).map_err(Error::Io)?;
-    let bytes = u64::try_from(bytes_read).unwrap_or(u64::MAX);
-    let samples =
-        u64::try_from(text.lines().filter(|line| !line.is_empty()).count()).unwrap_or(u64::MAX);
-    Ok((bytes, samples))
 }
 
 fn encode_batch(payloads: &[Payload], static_labels: &[(String, String)]) -> Result<Batch, Error> {

@@ -45,3 +45,16 @@ Normal operation does not write metric data to disk.
 ## Scope
 
 The crate intentionally owns only metric serialization and reliable delivery. It does **not** own an HTTP server, application scheduling, dashboard definitions, or metric collection. Applications decide when a fact changed and call the crate.
+
+
+## Large backlog recovery
+
+Historical spool files are replayed oldest-first, with up to 128 files and
+512 KiB of uncompressed Prometheus lines combined into one bounded gzip POST.
+File and frame ordering are preserved. Only after the backend successfully
+acknowledges the grouped request are its source files deleted; an ambiguous
+HTTP failure leaves them available for at-least-once retry, just as before.
+Large single files are handled atomically rather than partly discarded.
+This avoids hours of individual network round trips after an outage and
+prevents old metric backlogs from blocking fresh daemon heartbeat samples.
+Normal change-driven delivery remains immediate (no new batching timer).
