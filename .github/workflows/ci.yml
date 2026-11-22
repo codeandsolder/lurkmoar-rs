@@ -13,21 +13,12 @@ permissions:
   contents: read
 
 jobs:
-  stable:
-    runs-on: ubuntu-26.04
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # master
-        with:
-          toolchain: "1.100.0"
-          components: clippy,rustfmt
-      - name: Setup mandatory sccache
-        uses: codeandsolder/ci-workflows/.github/actions/setup-sccache@ecf97ef6708aaba39d6afad83bb82ebcca84723a # main
-        with:
-          rust-toolchain: "1.100.0"
-      - run: cargo fmt --all --check
-      - run: cargo test --locked
-      - run: cargo clippy --locked --all-targets -- -D warnings
-      - name: Finalize mandatory sccache
-        if: always()
-        uses: codeandsolder/ci-workflows/.github/actions/finalize-sccache@ecf97ef6708aaba39d6afad83bb82ebcca84723a # main
+  rust:
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@59b38db879d10529d2bfe3ab7bc34a8c076900fd # main
+    with:
+      runner: ubuntu-26.04
+      command: |
+        cargo fmt --all --check
+        cargo test --locked
+        cargo clippy --locked --all-targets -- -D warnings
+        cargo test --locked --release
