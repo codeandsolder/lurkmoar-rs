@@ -146,7 +146,7 @@ pub struct ClientBuilder {
 }
 
 impl ClientBuilder {
-    #[must_use]
+    #[must_use = "the constructed client builder must be used"]
     pub fn new(endpoint: impl Into<String>) -> Self {
         Self {
             endpoint: endpoint.into(),
@@ -159,31 +159,31 @@ impl ClientBuilder {
         }
     }
 
-    #[must_use]
+    #[must_use = "the returned builder contains the new static label"]
     pub fn static_label(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.static_labels.push((name.into(), value.into()));
         self
     }
 
-    #[must_use]
+    #[must_use = "the returned builder contains the new request timeout"]
     pub const fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
     }
 
-    #[must_use]
+    #[must_use = "the returned builder contains the new retry interval"]
     pub const fn retry_interval(mut self, retry_interval: Duration) -> Self {
         self.retry_interval = retry_interval;
         self
     }
 
-    #[must_use]
+    #[must_use = "the returned builder contains the new spill delay"]
     pub const fn spill_after(mut self, spill_after: Duration) -> Self {
         self.spill_after = spill_after;
         self
     }
 
-    #[must_use]
+    #[must_use = "the returned builder contains the new spool configuration"]
     pub fn spool(mut self, directory: impl Into<PathBuf>, max_bytes: u64) -> Self {
         self.spool_dir = Some(directory.into());
         self.spool_max_bytes = max_bytes;
@@ -308,12 +308,12 @@ impl Client {
         Counter::new(self.clone(), name, labels)
     }
 
-    #[must_use]
+    #[must_use = "the returned snapshot contains observed delivery health"]
     pub fn health(&self) -> HealthSnapshot {
         self.health.snapshot()
     }
 
-    #[must_use]
+    #[must_use = "the returned encoded metrics must be used"]
     pub fn health_prometheus(&self, prefix: &str) -> String {
         let health = self.health();
         format!(

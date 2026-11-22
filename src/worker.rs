@@ -62,6 +62,41 @@ pub fn spawn(
         .map_err(Error::Io)
 }
 
+// Cap each steady-state compression/delivery unit, even if producers
+// replenish the command queue faster than consumption. This is a payload
+// count bound (like the replay file-count bound), not a total memory bound.
+// A flush is a FIFO barrier: it must not wait for later submissions.
+const LIVE_MAX_PAYLOADS_PER_REQUEST: usize = 128;
+
+struct ReadyBatch {
+    payloads: Vec<Payload>,
+    flush: Option<mpsc::SyncSender<Result<(), Error>>>,
+    disconnected: bool,
+}
+
+fn take_ready_batch(first: Payload, receiver: &mpsc::Receiver<Command>) -> ReadyBatch {
+    let mut batch = ReadyBatch {
+        payloads: vec![first],
+        flush: None,
+        disconnected: false,
+    };
+    while batch.payloads.len() < LIVE_MAX_PAYLOADS_PER_REQUEST {
+        match receiver.try_recv() {
+            Ok(Command::Payload(payload)) => batch.payloads.push(payload),
+            Ok(Command::Flush(waiter)) => {
+                batch.flush = Some(waiter);
+                break;
+            }
+            Err(mpsc::TryRecvError::Empty) => break,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                batch.disconnected = true;
+                break;
+            }
+        }
+    }
+    batch
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "the delivery state machine is easier to audit as one ordered loop"
@@ -86,20 +121,12 @@ fn run(receiver: &mpsc::Receiver<Command>, health: &Health, config: &Config) {
         if offline_since.is_none() {
             match receiver.recv() {
                 Ok(Command::Payload(first)) => {
-                    let mut payloads = vec![first];
-                    let mut flush_waiters = Vec::new();
-                    let mut disconnected = false;
-                    loop {
-                        match receiver.try_recv() {
-                            Ok(Command::Payload(payload)) => payloads.push(payload),
-                            Ok(Command::Flush(waiter)) => flush_waiters.push(waiter),
-                            Err(mpsc::TryRecvError::Empty) => break,
-                            Err(mpsc::TryRecvError::Disconnected) => {
-                                disconnected = true;
-                                break;
-                            }
-                        }
-                    }
+                    let ReadyBatch {
+                        payloads,
+                        flush,
+                        disconnected,
+                    } = take_ready_batch(first, receiver);
+                    let mut encoding_error = None;
                     match encode_batch(&payloads, &config.static_labels) {
                         Ok(batch) => {
                             record_encoded(health, &batch);
@@ -121,11 +148,26 @@ fn run(receiver: &mpsc::Receiver<Command>, health: &Health, config: &Config) {
                                 spill_deadline = Some(now + config.spill_after);
                             }
                         }
-                        Err(error) => tracing::warn!("lurkmoar: cannot encode metrics: {error}"),
+                        Err(error) => {
+                            tracing::warn!("lurkmoar: cannot encode metrics: {error}");
+                            let _ = health.dropped_batches_total.fetch_add(1, Ordering::Relaxed);
+                            encoding_error = Some(error);
+                        }
                     }
-                    for waiter in flush_waiters {
-                        let flush_result = attempt_delivery(&agent, health, config, &mut pending);
-                        let _ = waiter.send(flush_result);
+                    if let Some(waiter) = flush {
+                        let delivery = attempt_delivery(&agent, health, config, &mut pending);
+                        if delivery.is_ok() {
+                            offline_since = None;
+                            spill_deadline = None;
+                        } else {
+                            let now = Instant::now();
+                            if offline_since.is_none() {
+                                offline_since = Some(now);
+                                spill_deadline = Some(now + config.spill_after);
+                            }
+                            retry_deadline = now + config.retry_interval;
+                        }
+                        let _ = waiter.send(encoding_error.map_or(delivery, Err));
                     }
                     if disconnected {
                         shutdown(health, config, &mut pending);
@@ -133,7 +175,14 @@ fn run(receiver: &mpsc::Receiver<Command>, health: &Health, config: &Config) {
                     }
                 }
                 Ok(Command::Flush(waiter)) => {
-                    let _ = waiter.send(attempt_delivery(&agent, health, config, &mut pending));
+                    let result = attempt_delivery(&agent, health, config, &mut pending);
+                    if result.is_err() {
+                        let now = Instant::now();
+                        offline_since = Some(now);
+                        retry_deadline = now + config.retry_interval;
+                        spill_deadline = Some(now + config.spill_after);
+                    }
+                    let _ = waiter.send(result);
                 }
                 Err(_) => {
                     shutdown(health, config, &mut pending);
@@ -163,6 +212,8 @@ fn run(receiver: &mpsc::Receiver<Command>, health: &Health, config: &Config) {
                 if result.is_ok() {
                     offline_since = None;
                     spill_deadline = None;
+                } else {
+                    retry_deadline = Instant::now() + config.retry_interval;
                 }
                 let _ = waiter.send(result);
             }
@@ -633,6 +684,54 @@ mod tests {
                 "reason_info{reason=\"multiple input files\",instance=\"host-a\"} 3 1234\n",
             )
         );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::{Command, LIVE_MAX_PAYLOADS_PER_REQUEST, Payload, take_ready_batch};
+    use std::sync::mpsc;
+
+    fn payload(index: usize) -> Payload {
+        Payload::PrometheusText {
+            text: index.to_string(),
+            timestamp_ms: 0,
+        }
+    }
+
+    #[test]
+    fn ready_batches_are_bounded_and_do_not_consume_after_flush()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (sender, receiver) = mpsc::channel();
+        let (flush, waiter) = mpsc::sync_channel(1);
+        for index in 1..=LIVE_MAX_PAYLOADS_PER_REQUEST {
+            sender.send(Command::Payload(payload(index)))?;
+        }
+        sender.send(Command::Flush(flush))?;
+        sender.send(Command::Payload(payload(LIVE_MAX_PAYLOADS_PER_REQUEST + 1)))?;
+        drop(sender);
+
+        let first = take_ready_batch(payload(0), &receiver);
+        assert_eq!(first.payloads.len(), LIVE_MAX_PAYLOADS_PER_REQUEST);
+        assert!(first.flush.is_none());
+        assert!(!first.disconnected);
+        let Command::Payload(next) = receiver.try_recv()? else {
+            return Err("expected remaining payload before flush".into());
+        };
+        let second = take_ready_batch(next, &receiver);
+        assert_eq!(second.payloads.len(), 1);
+        let Some(flush) = second.flush else {
+            return Err("expected flush barrier".into());
+        };
+        flush.send(Ok(()))?;
+        waiter.recv()??;
+        let Command::Payload(last) = receiver.try_recv()? else {
+            return Err("expected payload after flush".into());
+        };
+        let final_batch = take_ready_batch(last, &receiver);
+        assert_eq!(final_batch.payloads.len(), 1);
+        assert!(final_batch.disconnected);
         Ok(())
     }
 }
