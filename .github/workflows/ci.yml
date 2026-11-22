@@ -14,7 +14,7 @@ permissions:
 
 jobs:
   rust:
-    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@8e1f9d2c450e4761884b72a00a2f324e87a3f3cb # main
+    uses: codeandsolder/ci-workflows/.github/workflows/rust-sccache.yml@d3d509b57a06e72885a83ae743a4014e97cd9f95 # main
     with:
       runner: ubuntu-26.04
       command: |
