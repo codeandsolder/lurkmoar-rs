@@ -1,0 +1,5 @@
+# Fleet compiler, updated by the coordinated promotion controller.
+[toolchain]
+channel = "nightly-2026-11-19"
+profile = "minimal"
+components = ["clippy", "rustfmt"]
