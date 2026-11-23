@@ -45,3 +45,6 @@ allow_attributes_without_reason = "deny"
 broken_intra_doc_links = "deny"
 private_intra_doc_links = "warn"
 missing_crate_level_docs = "warn"
+
+[patch.crates-io]
+zlib-rs = { git = "https://github.com/codeandsolder/zlib-rs-fast.git", rev = "1ec3a5612ee28803a7756fa52bd013389507a2db" }
