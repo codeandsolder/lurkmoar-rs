@@ -1,6 +1,8 @@
+use bytes::Bytes;
 use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
+use reqwest::blocking::Client;
 use std::collections::VecDeque;
 use std::fs;
 use std::io::{Read, Write};
@@ -45,7 +47,7 @@ pub struct Config {
 
 #[derive(Debug)]
 struct Batch {
-    gzip: Vec<u8>,
+    gzip: Bytes,
     uncompressed_bytes: u64,
     samples: u64,
 }
@@ -55,11 +57,43 @@ pub fn spawn(
     health: Arc<Health>,
     config: Config,
 ) -> Result<(), Error> {
-    thread::Builder::new()
+    let (ready, startup) = mpsc::sync_channel(1);
+    let _worker = thread::Builder::new()
         .name("lurkmoar".into())
-        .spawn(move || run(&receiver, &health, &config))
-        .map(|_| ())
-        .map_err(Error::Io)
+        .spawn(move || {
+            // The blocking client owns an internal runtime. Construct and
+            // destroy it on the delivery thread, never in the caller's runtime.
+            match http_client(config.timeout) {
+                Ok(client) => {
+                    if ready.send(Ok(())).is_ok() {
+                        run(&client, &receiver, &health, &config);
+                    }
+                }
+                Err(error) => {
+                    let _ = ready.send(Err(error));
+                }
+            }
+        })?;
+    startup.recv().map_err(|_| Error::Closed)?
+}
+
+fn http_client(timeout: Duration) -> Result<Client, Error> {
+    let builder = Client::builder()
+        .timeout(timeout)
+        // A redirect may turn a metrics POST into a GET; never acknowledge it
+        // as a successful ingestion.
+        .redirect(reqwest::redirect::Policy::none());
+    #[cfg(all(not(target_os = "android"), any(unix, windows)))]
+    let builder = builder.tls_certs_merge(
+        webpki_root_certs::TLS_SERVER_ROOT_CERTS
+            .iter()
+            .map(|cert| reqwest::Certificate::from_der(cert.as_ref()))
+            .collect::<reqwest::Result<Vec<_>>>()
+            .map_err(|error| Error::Delivery(error.to_string()))?,
+    );
+    builder
+        .build()
+        .map_err(|error| Error::Delivery(error.to_string()))
 }
 
 // Cap each steady-state compression/delivery unit, even if producers
@@ -101,15 +135,11 @@ fn take_ready_batch(first: Payload, receiver: &mpsc::Receiver<Command>) -> Ready
     clippy::too_many_lines,
     reason = "the delivery state machine is easier to audit as one ordered loop"
 )]
-fn run(receiver: &mpsc::Receiver<Command>, health: &Health, config: &Config) {
-    let agent_config = ureq::Agent::config_builder()
-        .timeout_global(Some(config.timeout))
-        .build();
-    let agent: ureq::Agent = agent_config.into();
+fn run(client: &Client, receiver: &mpsc::Receiver<Command>, health: &Health, config: &Config) {
     update_spool_bytes(health, config.spool_dir.as_deref());
 
     let mut pending = VecDeque::new();
-    let mut offline_since = if replay_spool(&agent, health, config).is_ok() {
+    let mut offline_since = if replay_spool(client, health, config).is_ok() {
         None
     } else {
         Some(Instant::now())
@@ -131,7 +161,7 @@ fn run(receiver: &mpsc::Receiver<Command>, health: &Health, config: &Config) {
                         Ok(batch) => {
                             record_encoded(health, &batch);
                             if let Err(error) = send_gzip(
-                                &agent,
+                                client,
                                 health,
                                 &config.endpoint,
                                 &batch.gzip,
@@ -155,7 +185,7 @@ fn run(receiver: &mpsc::Receiver<Command>, health: &Health, config: &Config) {
                         }
                     }
                     if let Some(waiter) = flush {
-                        let delivery = attempt_delivery(&agent, health, config, &mut pending);
+                        let delivery = attempt_delivery(client, health, config, &mut pending);
                         if delivery.is_ok() {
                             offline_since = None;
                             spill_deadline = None;
@@ -175,7 +205,7 @@ fn run(receiver: &mpsc::Receiver<Command>, health: &Health, config: &Config) {
                     }
                 }
                 Ok(Command::Flush(waiter)) => {
-                    let result = attempt_delivery(&agent, health, config, &mut pending);
+                    let result = attempt_delivery(client, health, config, &mut pending);
                     if result.is_err() {
                         let now = Instant::now();
                         offline_since = Some(now);
@@ -208,7 +238,7 @@ fn run(receiver: &mpsc::Receiver<Command>, health: &Health, config: &Config) {
                 }
             }
             Ok(Command::Flush(waiter)) => {
-                let result = attempt_delivery(&agent, health, config, &mut pending);
+                let result = attempt_delivery(client, health, config, &mut pending);
                 if result.is_ok() {
                     offline_since = None;
                     spill_deadline = None;
@@ -232,7 +262,7 @@ fn run(receiver: &mpsc::Receiver<Command>, health: &Health, config: &Config) {
             spill_deadline = Some(now + config.spill_after);
         }
         if now >= retry_deadline {
-            if attempt_delivery(&agent, health, config, &mut pending).is_ok() {
+            if attempt_delivery(client, health, config, &mut pending).is_ok() {
                 offline_since = None;
                 spill_deadline = None;
             } else {
@@ -254,15 +284,15 @@ fn shutdown(health: &Health, config: &Config, pending: &mut VecDeque<Batch>) {
 }
 
 fn attempt_delivery(
-    agent: &ureq::Agent,
+    client: &Client,
     health: &Health,
     config: &Config,
     pending: &mut VecDeque<Batch>,
 ) -> Result<(), Error> {
-    replay_spool(agent, health, config)?;
+    replay_spool(client, health, config)?;
     while let Some(batch) = pending.front() {
         send_gzip(
-            agent,
+            client,
             health,
             &config.endpoint,
             &batch.gzip,
@@ -286,7 +316,7 @@ const REPLAY_MAX_UNCOMPRESSED_BYTES: usize = 512 * 1024;
 /// Submit all fully buffered files as one gzip document. On any delivery
 /// failure, leave every file intact so the next attempt can replay it.
 fn send_replay_files(
-    agent: &ureq::Agent,
+    client: &Client,
     health: &Health,
     config: &Config,
     paths: &mut Vec<PathBuf>,
@@ -298,9 +328,9 @@ fn send_replay_files(
     }
     let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
     encoder.write_all(text.as_bytes())?;
-    let payload = encoder.finish()?;
+    let payload = Bytes::from(encoder.finish()?);
     send_gzip(
-        agent,
+        client,
         health,
         &config.endpoint,
         &payload,
@@ -316,7 +346,7 @@ fn send_replay_files(
     Ok(())
 }
 
-fn replay_spool(agent: &ureq::Agent, health: &Health, config: &Config) -> Result<(), Error> {
+fn replay_spool(client: &Client, health: &Health, config: &Config) -> Result<(), Error> {
     let Some(directory) = config.spool_dir.as_deref() else {
         return Ok(());
     };
@@ -351,7 +381,7 @@ fn replay_spool(agent: &ureq::Agent, health: &Health, config: &Config) -> Result
             && (paths.len() >= REPLAY_MAX_FILES_PER_REQUEST
                 || text.len().saturating_add(file_text.len()) > REPLAY_MAX_UNCOMPRESSED_BYTES)
         {
-            send_replay_files(agent, health, config, &mut paths, &mut text, &mut samples)?;
+            send_replay_files(client, health, config, &mut paths, &mut text, &mut samples)?;
         }
         text.push_str(&file_text);
         samples = samples.saturating_add(file_samples);
@@ -359,10 +389,10 @@ fn replay_spool(agent: &ureq::Agent, health: &Health, config: &Config) -> Result
         if paths.len() >= REPLAY_MAX_FILES_PER_REQUEST
             || text.len() >= REPLAY_MAX_UNCOMPRESSED_BYTES
         {
-            send_replay_files(agent, health, config, &mut paths, &mut text, &mut samples)?;
+            send_replay_files(client, health, config, &mut paths, &mut text, &mut samples)?;
         }
     }
-    send_replay_files(agent, health, config, &mut paths, &mut text, &mut samples)?;
+    send_replay_files(client, health, config, &mut paths, &mut text, &mut samples)?;
     update_spool_bytes(health, Some(directory));
     Ok(())
 }
@@ -378,7 +408,7 @@ fn spill_pending(
     if pending.is_empty() {
         return Ok(());
     }
-    let encoded = spool::encode(pending.iter().map(|batch| batch.gzip.as_slice()));
+    let encoded = spool::encode(pending.iter().map(|batch| batch.gzip.as_ref()));
     let existing = spool::size(directory)?;
     let encoded_len = u64::try_from(encoded.len()).unwrap_or(u64::MAX);
     if existing.saturating_add(encoded_len) > config.spool_max_bytes {
@@ -399,21 +429,30 @@ fn spill_pending(
 }
 
 fn send_gzip(
-    agent: &ureq::Agent,
+    client: &Client,
     health: &Health,
     endpoint: &str,
-    body: &[u8],
+    body: &Bytes,
     uncompressed_bytes: u64,
     samples: u64,
     replayed: bool,
 ) -> Result<(), Error> {
     let _ = health.attempts_total.fetch_add(1, Ordering::Relaxed);
     let started = Instant::now();
-    let result = agent
+    let result = client
         .post(endpoint)
         .header("Content-Type", "text/plain; version=0.0.4")
         .header("Content-Encoding", "gzip")
-        .send(body);
+        .body(Bytes::clone(body))
+        .send()
+        .map_err(|error| Error::Delivery(error.without_url().to_string()))
+        .and_then(|response| {
+            if response.status().is_success() {
+                Ok(())
+            } else {
+                Err(Error::Delivery(format!("HTTP {}", response.status())))
+            }
+        });
     let micros = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
     let _ = health
         .request_duration_microseconds_total
@@ -422,7 +461,7 @@ fn send_gzip(
         .last_request_duration_microseconds
         .store(micros, Ordering::Relaxed);
     match result {
-        Ok(_) => {
+        Ok(()) => {
             let _ = health.sent_batches_total.fetch_add(1, Ordering::Relaxed);
             let _ = health
                 .sent_samples_total
@@ -446,7 +485,7 @@ fn send_gzip(
         }
         Err(error) => {
             let _ = health.failures_total.fetch_add(1, Ordering::Relaxed);
-            Err(Error::Delivery(error.to_string()))
+            Err(error)
         }
     }
 }
@@ -523,7 +562,7 @@ fn encode_batch(payloads: &[Payload], static_labels: &[(String, String)]) -> Res
     let uncompressed_bytes = u64::try_from(text.len()).unwrap_or(u64::MAX);
     let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
     encoder.write_all(text.as_bytes())?;
-    let gzip = encoder.finish().map_err(Error::Io)?;
+    let gzip = Bytes::from(encoder.finish()?);
     Ok(Batch {
         gzip,
         uncompressed_bytes,

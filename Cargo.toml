@@ -7,8 +7,10 @@ description = "Tiny change-driven Prometheus metrics push client with bounded ou
 repository = "https://github.com/codeandsolder/lurkmoar-rs"
 
 [dependencies]
-flate2 = "1"
-ureq = "3"
+bytes = "1"
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls", "system-proxy"] }
+webpki-root-certs = "1"
 tracing = "0.1"
 
 [lints.rust]
@@ -47,4 +49,4 @@ private_intra_doc_links = "warn"
 missing_crate_level_docs = "warn"
 
 [patch.crates-io]
-zlib-rs = { git = "https://github.com/codeandsolder/zlib-rs-fast.git", rev = "1ec3a5612ee28803a7756fa52bd013389507a2db" }
+zlib-rs = { git = "https://github.com/codeandsolder/zlib-rs-fast.git", rev = "98f76b3a242099f2229b048360eeb4707246a68f" }
