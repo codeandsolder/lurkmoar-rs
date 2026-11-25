@@ -216,7 +216,7 @@ impl ClientBuilder {
         }
 
         let health = Arc::new(Health::default());
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         worker::spawn(
             receiver,
             Arc::clone(&health),
@@ -236,7 +236,7 @@ impl ClientBuilder {
 
 #[derive(Debug, Clone)]
 pub struct Client {
-    pub(crate) sender: mpsc::Sender<worker::Command>,
+    pub(crate) sender: tokio::sync::mpsc::UnboundedSender<worker::Command>,
     health: Arc<Health>,
 }
 

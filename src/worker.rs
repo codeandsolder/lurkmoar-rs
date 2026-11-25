@@ -2,7 +2,6 @@ use bytes::Bytes;
 use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
-use reqwest::blocking::Client;
 use std::collections::VecDeque;
 use std::fs;
 use std::io::{Read, Write};
@@ -11,6 +10,8 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc::{UnboundedReceiver, error::TryRecvError};
+use wreq::Client;
 
 use crate::{Error, Health, spool, unix_millis, unix_seconds};
 
@@ -53,7 +54,7 @@ struct Batch {
 }
 
 pub fn spawn(
-    receiver: mpsc::Receiver<Command>,
+    receiver: UnboundedReceiver<Command>,
     health: Arc<Health>,
     config: Config,
 ) -> Result<(), Error> {
@@ -61,14 +62,24 @@ pub fn spawn(
     let _worker = thread::Builder::new()
         .name("lurkmoar".into())
         .spawn(move || {
-            // The blocking client owns an internal runtime. Construct and
-            // destroy it on the delivery thread, never in the caller's runtime.
-            match http_client(config.timeout) {
-                Ok(client) => {
-                    if ready.send(Ok(())).is_ok() {
-                        run(&client, &receiver, &health, &config);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(Error::Io);
+            match runtime {
+                Ok(runtime) => runtime.block_on(async move {
+                    match http_client(config.timeout) {
+                        Ok(client) => {
+                            if ready.send(Ok(())).is_ok() {
+                                let mut receiver = receiver;
+                                run(&client, &mut receiver, &health, &config).await;
+                            }
+                        }
+                        Err(error) => {
+                            let _ = ready.send(Err(error));
+                        }
                     }
-                }
+                }),
                 Err(error) => {
                     let _ = ready.send(Err(error));
                 }
@@ -78,22 +89,11 @@ pub fn spawn(
 }
 
 fn http_client(timeout: Duration) -> Result<Client, Error> {
-    let builder = Client::builder()
+    Client::builder()
         .timeout(timeout)
-        // A redirect may turn a metrics POST into a GET; never acknowledge it
-        // as a successful ingestion.
-        .redirect(reqwest::redirect::Policy::none());
-    #[cfg(all(not(target_os = "android"), any(unix, windows)))]
-    let builder = builder.tls_certs_merge(
-        webpki_root_certs::TLS_SERVER_ROOT_CERTS
-            .iter()
-            .map(|cert| reqwest::Certificate::from_der(cert.as_ref()))
-            .collect::<reqwest::Result<Vec<_>>>()
-            .map_err(|error| Error::Delivery(error.to_string()))?,
-    );
-    builder
+        .redirect(wreq::redirect::Policy::none())
         .build()
-        .map_err(|error| Error::Delivery(error.to_string()))
+        .map_err(|error| Error::Delivery(error.without_uri().to_string()))
 }
 
 // Cap each steady-state compression/delivery unit, even if producers
@@ -108,7 +108,7 @@ struct ReadyBatch {
     disconnected: bool,
 }
 
-fn take_ready_batch(first: Payload, receiver: &mpsc::Receiver<Command>) -> ReadyBatch {
+fn take_ready_batch(first: Payload, receiver: &mut UnboundedReceiver<Command>) -> ReadyBatch {
     let mut batch = ReadyBatch {
         payloads: vec![first],
         flush: None,
@@ -121,8 +121,8 @@ fn take_ready_batch(first: Payload, receiver: &mpsc::Receiver<Command>) -> Ready
                 batch.flush = Some(waiter);
                 break;
             }
-            Err(mpsc::TryRecvError::Empty) => break,
-            Err(mpsc::TryRecvError::Disconnected) => {
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Disconnected) => {
                 batch.disconnected = true;
                 break;
             }
@@ -135,11 +135,16 @@ fn take_ready_batch(first: Payload, receiver: &mpsc::Receiver<Command>) -> Ready
     clippy::too_many_lines,
     reason = "the delivery state machine is easier to audit as one ordered loop"
 )]
-fn run(client: &Client, receiver: &mpsc::Receiver<Command>, health: &Health, config: &Config) {
+async fn run(
+    client: &Client,
+    receiver: &mut UnboundedReceiver<Command>,
+    health: &Health,
+    config: &Config,
+) {
     update_spool_bytes(health, config.spool_dir.as_deref());
 
     let mut pending = VecDeque::new();
-    let mut offline_since = if replay_spool(client, health, config).is_ok() {
+    let mut offline_since = if replay_spool(client, health, config).await.is_ok() {
         None
     } else {
         Some(Instant::now())
@@ -149,8 +154,8 @@ fn run(client: &Client, receiver: &mpsc::Receiver<Command>, health: &Health, con
 
     loop {
         if offline_since.is_none() {
-            match receiver.recv() {
-                Ok(Command::Payload(first)) => {
+            match receiver.recv().await {
+                Some(Command::Payload(first)) => {
                     let ReadyBatch {
                         payloads,
                         flush,
@@ -168,7 +173,9 @@ fn run(client: &Client, receiver: &mpsc::Receiver<Command>, health: &Health, con
                                 batch.uncompressed_bytes,
                                 batch.samples,
                                 false,
-                            ) {
+                            )
+                            .await
+                            {
                                 pending.push_back(batch);
                                 set_pending(health, pending.len());
                                 tracing::warn!("lurkmoar: delivery failed: {error}");
@@ -185,7 +192,7 @@ fn run(client: &Client, receiver: &mpsc::Receiver<Command>, health: &Health, con
                         }
                     }
                     if let Some(waiter) = flush {
-                        let delivery = attempt_delivery(client, health, config, &mut pending);
+                        let delivery = attempt_delivery(client, health, config, &mut pending).await;
                         if delivery.is_ok() {
                             offline_since = None;
                             spill_deadline = None;
@@ -204,8 +211,8 @@ fn run(client: &Client, receiver: &mpsc::Receiver<Command>, health: &Health, con
                         return;
                     }
                 }
-                Ok(Command::Flush(waiter)) => {
-                    let result = attempt_delivery(client, health, config, &mut pending);
+                Some(Command::Flush(waiter)) => {
+                    let result = attempt_delivery(client, health, config, &mut pending).await;
                     if result.is_err() {
                         let now = Instant::now();
                         offline_since = Some(now);
@@ -214,7 +221,7 @@ fn run(client: &Client, receiver: &mpsc::Receiver<Command>, health: &Health, con
                     }
                     let _ = waiter.send(result);
                 }
-                Err(_) => {
+                None => {
                     shutdown(health, config, &mut pending);
                     return;
                 }
@@ -226,8 +233,8 @@ fn run(client: &Client, receiver: &mpsc::Receiver<Command>, health: &Health, con
         let next_spill = spill_deadline.unwrap_or(now + config.spill_after);
         let wake_at = retry_deadline.min(next_spill);
         let wait = wake_at.saturating_duration_since(now);
-        match receiver.recv_timeout(wait) {
-            Ok(Command::Payload(payload)) => {
+        match tokio::time::timeout(wait, receiver.recv()).await {
+            Ok(Some(Command::Payload(payload))) => {
                 match encode_batch(&[payload], &config.static_labels) {
                     Ok(batch) => {
                         record_encoded(health, &batch);
@@ -237,8 +244,8 @@ fn run(client: &Client, receiver: &mpsc::Receiver<Command>, health: &Health, con
                     Err(error) => tracing::warn!("lurkmoar: cannot encode metrics: {error}"),
                 }
             }
-            Ok(Command::Flush(waiter)) => {
-                let result = attempt_delivery(client, health, config, &mut pending);
+            Ok(Some(Command::Flush(waiter))) => {
+                let result = attempt_delivery(client, health, config, &mut pending).await;
                 if result.is_ok() {
                     offline_since = None;
                     spill_deadline = None;
@@ -247,11 +254,11 @@ fn run(client: &Client, receiver: &mpsc::Receiver<Command>, health: &Health, con
                 }
                 let _ = waiter.send(result);
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Ok(None) => {
                 shutdown(health, config, &mut pending);
                 return;
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(_) => {}
         }
 
         let now = Instant::now();
@@ -262,7 +269,10 @@ fn run(client: &Client, receiver: &mpsc::Receiver<Command>, health: &Health, con
             spill_deadline = Some(now + config.spill_after);
         }
         if now >= retry_deadline {
-            if attempt_delivery(client, health, config, &mut pending).is_ok() {
+            if attempt_delivery(client, health, config, &mut pending)
+                .await
+                .is_ok()
+            {
                 offline_since = None;
                 spill_deadline = None;
             } else {
@@ -283,13 +293,13 @@ fn shutdown(health: &Health, config: &Config, pending: &mut VecDeque<Batch>) {
     }
 }
 
-fn attempt_delivery(
+async fn attempt_delivery(
     client: &Client,
     health: &Health,
     config: &Config,
     pending: &mut VecDeque<Batch>,
 ) -> Result<(), Error> {
-    replay_spool(client, health, config)?;
+    replay_spool(client, health, config).await?;
     while let Some(batch) = pending.front() {
         send_gzip(
             client,
@@ -299,7 +309,8 @@ fn attempt_delivery(
             batch.uncompressed_bytes,
             batch.samples,
             false,
-        )?;
+        )
+        .await?;
         let _ = pending.pop_front();
         set_pending(health, pending.len());
     }
@@ -315,7 +326,7 @@ const REPLAY_MAX_UNCOMPRESSED_BYTES: usize = 512 * 1024;
 
 /// Submit all fully buffered files as one gzip document. On any delivery
 /// failure, leave every file intact so the next attempt can replay it.
-fn send_replay_files(
+async fn send_replay_files(
     client: &Client,
     health: &Health,
     config: &Config,
@@ -337,7 +348,8 @@ fn send_replay_files(
         u64::try_from(text.len()).unwrap_or(u64::MAX),
         *samples,
         true,
-    )?;
+    )
+    .await?;
     for path in paths.drain(..) {
         fs::remove_file(path)?;
     }
@@ -346,7 +358,7 @@ fn send_replay_files(
     Ok(())
 }
 
-fn replay_spool(client: &Client, health: &Health, config: &Config) -> Result<(), Error> {
+async fn replay_spool(client: &Client, health: &Health, config: &Config) -> Result<(), Error> {
     let Some(directory) = config.spool_dir.as_deref() else {
         return Ok(());
     };
@@ -381,7 +393,7 @@ fn replay_spool(client: &Client, health: &Health, config: &Config) -> Result<(),
             && (paths.len() >= REPLAY_MAX_FILES_PER_REQUEST
                 || text.len().saturating_add(file_text.len()) > REPLAY_MAX_UNCOMPRESSED_BYTES)
         {
-            send_replay_files(client, health, config, &mut paths, &mut text, &mut samples)?;
+            send_replay_files(client, health, config, &mut paths, &mut text, &mut samples).await?;
         }
         text.push_str(&file_text);
         samples = samples.saturating_add(file_samples);
@@ -389,10 +401,10 @@ fn replay_spool(client: &Client, health: &Health, config: &Config) -> Result<(),
         if paths.len() >= REPLAY_MAX_FILES_PER_REQUEST
             || text.len() >= REPLAY_MAX_UNCOMPRESSED_BYTES
         {
-            send_replay_files(client, health, config, &mut paths, &mut text, &mut samples)?;
+            send_replay_files(client, health, config, &mut paths, &mut text, &mut samples).await?;
         }
     }
-    send_replay_files(client, health, config, &mut paths, &mut text, &mut samples)?;
+    send_replay_files(client, health, config, &mut paths, &mut text, &mut samples).await?;
     update_spool_bytes(health, Some(directory));
     Ok(())
 }
@@ -428,7 +440,7 @@ fn spill_pending(
     Ok(())
 }
 
-fn send_gzip(
+async fn send_gzip(
     client: &Client,
     health: &Health,
     endpoint: &str,
@@ -445,7 +457,8 @@ fn send_gzip(
         .header("Content-Encoding", "gzip")
         .body(Bytes::clone(body))
         .send()
-        .map_err(|error| Error::Delivery(error.without_url().to_string()))
+        .await
+        .map_err(|error| Error::Delivery(error.without_uri().to_string()))
         .and_then(|response| {
             if response.status().is_success() {
                 Ok(())
@@ -742,7 +755,7 @@ mod batch_tests {
     #[test]
     fn ready_batches_are_bounded_and_do_not_consume_after_flush()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (sender, receiver) = mpsc::channel();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let (flush, waiter) = mpsc::sync_channel(1);
         for index in 1..=LIVE_MAX_PAYLOADS_PER_REQUEST {
             sender.send(Command::Payload(payload(index)))?;
@@ -751,14 +764,14 @@ mod batch_tests {
         sender.send(Command::Payload(payload(LIVE_MAX_PAYLOADS_PER_REQUEST + 1)))?;
         drop(sender);
 
-        let first = take_ready_batch(payload(0), &receiver);
+        let first = take_ready_batch(payload(0), &mut receiver);
         assert_eq!(first.payloads.len(), LIVE_MAX_PAYLOADS_PER_REQUEST);
         assert!(first.flush.is_none());
         assert!(!first.disconnected);
         let Command::Payload(next) = receiver.try_recv()? else {
             return Err("expected remaining payload before flush".into());
         };
-        let second = take_ready_batch(next, &receiver);
+        let second = take_ready_batch(next, &mut receiver);
         assert_eq!(second.payloads.len(), 1);
         let Some(flush) = second.flush else {
             return Err("expected flush barrier".into());
@@ -768,7 +781,7 @@ mod batch_tests {
         let Command::Payload(last) = receiver.try_recv()? else {
             return Err("expected payload after flush".into());
         };
-        let final_batch = take_ready_batch(last, &receiver);
+        let final_batch = take_ready_batch(last, &mut receiver);
         assert_eq!(final_batch.payloads.len(), 1);
         assert!(final_batch.disconnected);
         Ok(())

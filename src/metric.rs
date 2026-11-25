@@ -152,12 +152,12 @@ mod tests {
         Client, Health,
         worker::{Command, Payload},
     };
-    use std::sync::{Arc, mpsc};
+    use std::sync::Arc;
 
     #[test]
     fn counter_updates_are_ordered_and_failed_updates_do_not_commit()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (sender, receiver) = mpsc::channel();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let client = Client {
             sender,
             health: Arc::new(Health::default()),
@@ -199,7 +199,7 @@ mod tests {
     #[test]
     fn counter_rejects_arithmetic_overflow_without_publishing()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (sender, receiver) = mpsc::channel();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         let client = Client {
             sender,
             health: Arc::new(Health::default()),
