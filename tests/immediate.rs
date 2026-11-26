@@ -266,3 +266,30 @@ fn historical_backlog_replays_in_bounded_multi_file_requests()
     std::fs::remove_dir(&spool_dir)?;
     Ok(())
 }
+
+#[test]
+fn redirected_ingestion_is_not_acknowledged() -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+{
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    let server = thread::spawn(
+        move || -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept()?;
+                consume_request(&mut stream)?;
+                stream.write_all(b"HTTP/1.1 302 Found\r\nLocation: /wrong\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")?;
+            }
+            Ok(())
+        },
+    );
+    let client = ClientBuilder::new(format!("http://{address}/import"))
+        .retry_interval(Duration::from_secs(60))
+        .build()?;
+    client.sample("redirect_test", 1.0, std::iter::empty::<(&str, &str)>())?;
+    assert!(client.flush().is_err());
+    let health = client.health();
+    assert_eq!(health.sent_samples_total, 0);
+    assert_eq!(health.failures_total, 2);
+    server.join().map_err(|_| "server thread panicked")??;
+    Ok(())
+}

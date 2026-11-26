@@ -2,13 +2,15 @@
 name = "lurkmoar"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.99"
+rust-version = "1.100"
 description = "Tiny change-driven Prometheus metrics push client with bounded outage spooling"
 repository = "https://github.com/codeandsolder/lurkmoar-rs"
 
 [dependencies]
-flate2 = "1"
-ureq = "3"
+bytes = "1"
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
+wreq = { git = "https://github.com/codeandsolder/wreq-exp.git", rev = "a8385c80ba6a5b035067d3a2e472d37df591faf0", default-features = false, features = ["tokio-rt", "webpki-roots", "native-roots", "system-proxy"] }
+tokio = { version = "1", features = ["rt", "net", "time", "sync"] }
 tracing = "0.1"
 
 [lints.rust]
@@ -47,4 +49,4 @@ private_intra_doc_links = "warn"
 missing_crate_level_docs = "warn"
 
 [patch.crates-io]
-zlib-rs = { git = "https://github.com/codeandsolder/zlib-rs-fast.git", rev = "1ec3a5612ee28803a7756fa52bd013389507a2db" }
+zlib-rs = { git = "https://github.com/codeandsolder/zlib-rs-fast.git", rev = "98f76b3a242099f2229b048360eeb4707246a68f" }
