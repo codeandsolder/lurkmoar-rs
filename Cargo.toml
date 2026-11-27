@@ -9,7 +9,7 @@ repository = "https://github.com/codeandsolder/lurkmoar-rs"
 [dependencies]
 bytes = "1"
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
-wreq = { git = "https://github.com/codeandsolder/wreq-exp.git", rev = "a8385c80ba6a5b035067d3a2e472d37df591faf0", default-features = false, features = ["tokio-rt", "webpki-roots", "native-roots", "system-proxy"] }
+wreq = { git = "https://github.com/codeandsolder/wreq-exp.git", rev = "16a946b3a9170d6cac4233ef3d1779d0f2fff743", default-features = false, features = ["tokio-rt", "webpki-roots", "native-roots", "system-proxy"] }
 tokio = { version = "1", features = ["rt", "net", "time", "sync"] }
 tracing = "0.1"
 
