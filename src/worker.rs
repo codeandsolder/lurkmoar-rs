@@ -1,60 +1,100 @@
 use bytes::Bytes;
 use flate2::Compression;
-use flate2::read::GzDecoder;
+use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
 use std::collections::VecDeque;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, mpsc};
 use std::thread;
-use std::time::{Duration, Instant};
-use tokio::sync::mpsc::{UnboundedReceiver, error::TryRecvError};
-use wreq::Client;
+use std::time::Duration;
+use tokio::sync::mpsc::Receiver;
+use tokio::time::Instant;
+use wreq::{Client, Uri};
 
-use crate::{Error, Health, spool, unix_millis, unix_seconds};
+use crate::{
+    Error, Health,
+    admission::Permit,
+    metric::{self, Series},
+    spool, unix_seconds,
+};
 
 #[derive(Debug)]
-pub enum Payload {
+pub(super) enum Payload {
     PrometheusText {
-        text: String,
+        text: Box<str>,
+        samples: u64,
         timestamp_ms: u64,
     },
     Sample {
-        name: String,
+        series: Arc<Series>,
         value: f64,
-        labels: Vec<(String, String)>,
         timestamp_ms: u64,
     },
 }
 
-#[derive(Debug)]
-pub enum Command {
-    Payload(Payload),
-    Flush(mpsc::SyncSender<Result<(), Error>>),
+impl Payload {
+    pub fn memory_cost(&self) -> usize {
+        // Account for queue/permit/batch metadata, gzip framing and the longest
+        // decimal double representation. Shared selectors are charged per sample.
+        match self {
+            Self::PrometheusText { text, .. } => text.len().saturating_add(256),
+            Self::Sample { series, .. } => series.as_str().len().saturating_add(768),
+        }
+    }
+
+    const fn timestamp_ms(&self) -> u64 {
+        match self {
+            Self::PrometheusText { timestamp_ms, .. } | Self::Sample { timestamp_ms, .. } => {
+                *timestamp_ms
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
-pub struct Config {
-    pub endpoint: String,
-    pub static_labels: Vec<(String, String)>,
+pub(super) struct QueuedPayload {
+    pub payload: Payload,
+    pub permit: Permit,
+}
+
+type Waiter = mpsc::SyncSender<Result<(), Error>>;
+
+#[derive(Debug)]
+pub(super) enum Command {
+    Payload(QueuedPayload),
+    Flush(Waiter),
+    Shutdown(Waiter),
+}
+
+#[derive(Debug)]
+pub(super) struct Config {
+    pub endpoint: Uri,
     pub timeout: Duration,
     pub retry_interval: Duration,
     pub spill_after: Duration,
-    pub spool_dir: Option<PathBuf>,
+    pub spool: Option<spool::Store>,
     pub spool_max_bytes: u64,
 }
 
 #[derive(Debug)]
-struct Batch {
+struct Encoded {
     gzip: Bytes,
     uncompressed_bytes: u64,
     samples: u64,
 }
 
-pub fn spawn(
-    receiver: UnboundedReceiver<Command>,
+#[derive(Debug)]
+struct Batch {
+    data: Encoded,
+    oldest_ms: u64,
+    _permits: Vec<Permit>,
+}
+
+pub(super) fn spawn(
+    receiver: Receiver<Command>,
     health: Arc<Health>,
     config: Config,
 ) -> Result<(), Error> {
@@ -62,28 +102,40 @@ pub fn spawn(
     let _worker = thread::Builder::new()
         .name("lurkmoar".into())
         .spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
+            let runtime = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .map_err(Error::Io);
-            match runtime {
-                Ok(runtime) => runtime.block_on(async move {
-                    match http_client(config.timeout) {
-                        Ok(client) => {
-                            if ready.send(Ok(())).is_ok() {
-                                let mut receiver = receiver;
-                                run(&client, &mut receiver, &health, &config).await;
-                            }
-                        }
-                        Err(error) => {
-                            let _ = ready.send(Err(error));
-                        }
-                    }
-                }),
+            {
+                Ok(runtime) => runtime,
                 Err(error) => {
-                    let _ = ready.send(Err(error));
+                    let _ = ready.send(Err(error.into()));
+                    return;
                 }
-            }
+            };
+            runtime.block_on(async move {
+                let client = match http_client(config.timeout) {
+                    Ok(client) => client,
+                    Err(error) => {
+                        let _ = ready.send(Err(error));
+                        return;
+                    }
+                };
+                if let Err(error) = refresh_spool(&health, config.spool.as_ref()) {
+                    let _ = ready.send(Err(error));
+                    return;
+                }
+                if ready.send(Ok(())).is_err() {
+                    return;
+                }
+                let (waiter, result) = run(&client, receiver, &health, &config).await;
+                // Explicit shutdown completion means the spool lock was released.
+                drop(config);
+                if let Some(waiter) = waiter {
+                    let _ = waiter.send(result);
+                } else if let Err(error) = result {
+                    tracing::error!(%error, "lurkmoar: implicit shutdown failed");
+                }
+            });
         })?;
     startup.recv().map_err(|_| Error::Closed)?
 }
@@ -93,377 +145,584 @@ fn http_client(timeout: Duration) -> Result<Client, Error> {
         .timeout(timeout)
         .redirect(wreq::redirect::Policy::none())
         .build()
-        .map_err(|error| Error::Delivery(error.without_uri().to_string()))
+        .map_err(|error| Error::Transport(error.without_uri()))
 }
 
-// Cap each steady-state compression/delivery unit, even if producers
-// replenish the command queue faster than consumption. This is a payload
-// count bound (like the replay file-count bound), not a total memory bound.
-// A flush is a FIFO barrier: it must not wait for later submissions.
-const LIVE_MAX_PAYLOADS_PER_REQUEST: usize = 128;
+// A large snapshot is atomic; otherwise stop at either request limit. No
+// deliberate steady-state batching timer. Deferred commands preserve FIFO
+// order even at byte boundaries and across flush/shutdown barriers.
+const LIVE_MAX_PAYLOADS: usize = 128;
+const REQUEST_TARGET_BYTES: usize = 512 * 1024;
 
-struct ReadyBatch {
-    payloads: Vec<Payload>,
-    flush: Option<mpsc::SyncSender<Result<(), Error>>>,
-    disconnected: bool,
+struct Inbox {
+    receiver: Receiver<Command>,
+    deferred: Option<Command>,
 }
 
-fn take_ready_batch(first: Payload, receiver: &mut UnboundedReceiver<Command>) -> ReadyBatch {
-    let mut batch = ReadyBatch {
-        payloads: vec![first],
-        flush: None,
-        disconnected: false,
-    };
-    while batch.payloads.len() < LIVE_MAX_PAYLOADS_PER_REQUEST {
-        match receiver.try_recv() {
-            Ok(Command::Payload(payload)) => batch.payloads.push(payload),
-            Ok(Command::Flush(waiter)) => {
-                batch.flush = Some(waiter);
-                break;
+impl Inbox {
+    async fn recv(&mut self) -> Option<Command> {
+        match self.deferred.take() {
+            Some(command) => Some(command),
+            None => self.receiver.recv().await,
+        }
+    }
+
+    fn take_batch(&mut self, first: QueuedPayload) -> Vec<QueuedPayload> {
+        let mut bytes = first.payload.memory_cost();
+        let mut payloads = vec![first];
+        while payloads.len() < LIVE_MAX_PAYLOADS && bytes < REQUEST_TARGET_BYTES {
+            match self.receiver.try_recv() {
+                Ok(Command::Payload(next))
+                    if bytes.saturating_add(next.payload.memory_cost()) <= REQUEST_TARGET_BYTES =>
+                {
+                    bytes += next.payload.memory_cost();
+                    payloads.push(next);
+                }
+                Ok(command) => {
+                    self.deferred = Some(command);
+                    break;
+                }
+                Err(_) => break, // empty or disconnected; recv observes closure
             }
-            Err(TryRecvError::Empty) => break,
-            Err(TryRecvError::Disconnected) => {
-                batch.disconnected = true;
-                break;
+        }
+        payloads
+    }
+}
+
+#[derive(Debug)]
+struct Outage {
+    retry_at: Instant,
+    spill_at: Option<Instant>,
+}
+
+impl Outage {
+    fn new(config: &Config) -> Self {
+        let now = Instant::now();
+        Self {
+            retry_at: now + config.retry_interval,
+            spill_at: config.spool.as_ref().map(|_| now + config.spill_after),
+        }
+    }
+
+    fn deadline(&self) -> Instant {
+        self.spill_at
+            .map_or(self.retry_at, |spill| spill.min(self.retry_at))
+    }
+}
+
+struct Delivery<'a> {
+    client: &'a Client,
+    health: &'a Health,
+    config: &'a Config,
+    pending: VecDeque<Batch>,
+    outage: Option<Outage>,
+    reported_drops: u64,
+}
+
+impl Delivery<'_> {
+    fn record_drop(&self, batches: u64) {
+        let _ = self
+            .health
+            .dropped_batches_total
+            .fetch_add(batches, Ordering::Relaxed);
+    }
+
+    fn report_new_drops(&mut self) -> Result<(), Error> {
+        let total = self.health.dropped_batches_total.load(Ordering::Relaxed);
+        let batches = total.saturating_sub(self.reported_drops);
+        self.reported_drops = total;
+        if batches == 0 {
+            Ok(())
+        } else {
+            Err(Error::Dropped { batches })
+        }
+    }
+
+    fn failed(&mut self, error: &Error) {
+        tracing::warn!(%error, "lurkmoar: delivery failed");
+        if let Some(outage) = &mut self.outage {
+            // Backoff starts after the failed request, not before it.
+            outage.retry_at = Instant::now() + self.config.retry_interval;
+        } else {
+            self.outage = Some(Outage::new(self.config));
+        }
+    }
+
+    async fn send_pending(&mut self) -> Result<(), Error> {
+        while let Some(batch) = self.pending.front() {
+            send_gzip(
+                self.client,
+                self.health,
+                &self.config.endpoint,
+                &batch.data,
+                false,
+            )
+            .await?;
+            let _ = self.pending.pop_front();
+            self.refresh_ram();
+        }
+        Ok(())
+    }
+
+    async fn recover(&mut self) -> Result<(), Error> {
+        let result = async {
+            replay_spool(self.client, self.health, self.config).await?;
+            self.send_pending().await
+        }
+        .await;
+        match &result {
+            Ok(()) => self.outage = None,
+            Err(error) => self.failed(error),
+        }
+        result
+    }
+
+    fn refresh_ram(&self) {
+        self.health
+            .pending_batches
+            .store(self.pending.len(), Ordering::Relaxed);
+        let oldest = self.pending.iter().map(|batch| batch.oldest_ms).min();
+        self.health
+            .oldest_ram_unixtime
+            .store(encode_age(oldest), Ordering::Relaxed);
+    }
+
+    async fn accept(&mut self, payloads: Vec<QueuedPayload>) {
+        match encode_batch(payloads) {
+            Ok(batch) => {
+                record_encoded(self.health, &batch.data);
+                self.pending.push_back(batch);
+                self.refresh_ram();
+                if self.outage.is_none()
+                    && let Err(error) = self.send_pending().await
+                {
+                    self.failed(&error);
+                }
+            }
+            Err(error) => {
+                self.record_drop(1);
+                tracing::error!(%error, "lurkmoar: failed to encode admitted batch");
             }
         }
     }
-    batch
+
+    async fn flush(&mut self) -> Result<(), Error> {
+        if self.outage.is_some() {
+            self.recover().await?;
+        }
+        self.report_new_drops()
+    }
+
+    async fn tick(&mut self) {
+        let Some(outage) = &self.outage else {
+            return;
+        };
+        let now = Instant::now();
+        let spill_due = outage.spill_at.is_some_and(|deadline| deadline <= now);
+        let retry_due = outage.retry_at <= now;
+        if spill_due {
+            if let Err(error) = self.spill() {
+                tracing::warn!(%error, "lurkmoar: spool write failed; retaining RAM backlog");
+            }
+            if let Some(outage) = &mut self.outage {
+                outage.spill_at = Some(Instant::now() + self.config.spill_after);
+            }
+        }
+        if retry_due {
+            // recover records the failure and schedules the next attempt.
+            let _ = self.recover().await;
+        }
+    }
+
+    fn spill(&mut self) -> Result<(), Error> {
+        let Some(store) = &self.config.spool else {
+            return Ok(());
+        };
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let existing = store
+            .files()?
+            .iter()
+            .fold(0_u64, |sum, entry| sum.saturating_add(entry.bytes));
+        let mut available = self
+            .config
+            .spool_max_bytes
+            .saturating_sub(existing)
+            .saturating_sub(spool::HEADER_BYTES);
+        let mut count = 0;
+        for batch in &self.pending {
+            let bytes = u64::try_from(batch.data.gzip.len())
+                .unwrap_or(u64::MAX)
+                .saturating_add(spool::FRAME_HEADER_BYTES);
+            if bytes > available {
+                break;
+            }
+            available -= bytes;
+            count += 1;
+        }
+        if count > 0 {
+            let encoded = spool::encode(
+                self.pending
+                    .iter()
+                    .take(count)
+                    .map(|batch| batch.data.gzip.as_ref()),
+            )?;
+            let oldest = self
+                .pending
+                .iter()
+                .take(count)
+                .map(|batch| batch.oldest_ms)
+                .min()
+                .ok_or_else(|| Error::State("nonempty spill has no timestamp".into()))?;
+            store.write(oldest, &encoded)?;
+            drop(self.pending.drain(..count));
+        }
+        // Preserve the maximal oldest prefix that fits. Never evict older
+        // persisted backlog to admit newer data, and never silently lose it.
+        if !self.pending.is_empty() {
+            let dropped = u64::try_from(self.pending.len()).unwrap_or(u64::MAX);
+            self.record_drop(dropped);
+            tracing::warn!(
+                dropped,
+                "lurkmoar: spool capacity exhausted; dropping newest batches"
+            );
+            self.pending.clear();
+        }
+        self.refresh_ram();
+        refresh_spool(self.health, Some(store))
+    }
+
+    fn finish(&mut self) -> Result<(), Error> {
+        let result = self.spill();
+        if !self.pending.is_empty() {
+            let dropped = u64::try_from(self.pending.len()).unwrap_or(u64::MAX);
+            self.record_drop(dropped);
+            tracing::error!(
+                dropped,
+                "lurkmoar: shutdown could not persist pending batches"
+            );
+            self.pending.clear();
+            self.refresh_ram();
+        }
+        result?;
+        self.report_new_drops()
+    }
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "the delivery state machine is easier to audit as one ordered loop"
-)]
 async fn run(
     client: &Client,
-    receiver: &mut UnboundedReceiver<Command>,
+    receiver: Receiver<Command>,
     health: &Health,
     config: &Config,
-) {
-    update_spool_bytes(health, config.spool_dir.as_deref());
-
-    let mut pending = VecDeque::new();
-    let mut offline_since = if replay_spool(client, health, config).await.is_ok() {
-        None
-    } else {
-        Some(Instant::now())
+) -> (Option<Waiter>, Result<(), Error>) {
+    let mut inbox = Inbox {
+        receiver,
+        deferred: None,
     };
-    let mut retry_deadline = Instant::now() + config.retry_interval;
-    let mut spill_deadline = offline_since.map(|start| start + config.spill_after);
-
-    loop {
-        if offline_since.is_none() {
-            match receiver.recv().await {
-                Some(Command::Payload(first)) => {
-                    let ReadyBatch {
-                        payloads,
-                        flush,
-                        disconnected,
-                    } = take_ready_batch(first, receiver);
-                    let mut encoding_error = None;
-                    match encode_batch(&payloads, &config.static_labels) {
-                        Ok(batch) => {
-                            record_encoded(health, &batch);
-                            if let Err(error) = send_gzip(
-                                client,
-                                health,
-                                &config.endpoint,
-                                &batch.gzip,
-                                batch.uncompressed_bytes,
-                                batch.samples,
-                                false,
-                            )
-                            .await
-                            {
-                                pending.push_back(batch);
-                                set_pending(health, pending.len());
-                                tracing::warn!("lurkmoar: delivery failed: {error}");
-                                let now = Instant::now();
-                                offline_since = Some(now);
-                                retry_deadline = now + config.retry_interval;
-                                spill_deadline = Some(now + config.spill_after);
-                            }
-                        }
-                        Err(error) => {
-                            tracing::warn!("lurkmoar: cannot encode metrics: {error}");
-                            let _ = health.dropped_batches_total.fetch_add(1, Ordering::Relaxed);
-                            encoding_error = Some(error);
-                        }
-                    }
-                    if let Some(waiter) = flush {
-                        let delivery = attempt_delivery(client, health, config, &mut pending).await;
-                        if delivery.is_ok() {
-                            offline_since = None;
-                            spill_deadline = None;
-                        } else {
-                            let now = Instant::now();
-                            if offline_since.is_none() {
-                                offline_since = Some(now);
-                                spill_deadline = Some(now + config.spill_after);
-                            }
-                            retry_deadline = now + config.retry_interval;
-                        }
-                        let _ = waiter.send(encoding_error.map_or(delivery, Err));
-                    }
-                    if disconnected {
-                        shutdown(health, config, &mut pending);
-                        return;
-                    }
-                }
-                Some(Command::Flush(waiter)) => {
-                    let result = attempt_delivery(client, health, config, &mut pending).await;
-                    if result.is_err() {
-                        let now = Instant::now();
-                        offline_since = Some(now);
-                        retry_deadline = now + config.retry_interval;
-                        spill_deadline = Some(now + config.spill_after);
-                    }
-                    let _ = waiter.send(result);
-                }
-                None => {
-                    shutdown(health, config, &mut pending);
-                    return;
-                }
-            }
-            continue;
-        }
-
-        let now = Instant::now();
-        let next_spill = spill_deadline.unwrap_or(now + config.spill_after);
-        let wake_at = retry_deadline.min(next_spill);
-        let wait = wake_at.saturating_duration_since(now);
-        match tokio::time::timeout(wait, receiver.recv()).await {
-            Ok(Some(Command::Payload(payload))) => {
-                match encode_batch(&[payload], &config.static_labels) {
-                    Ok(batch) => {
-                        record_encoded(health, &batch);
-                        pending.push_back(batch);
-                        set_pending(health, pending.len());
-                    }
-                    Err(error) => tracing::warn!("lurkmoar: cannot encode metrics: {error}"),
-                }
-            }
-            Ok(Some(Command::Flush(waiter))) => {
-                let result = attempt_delivery(client, health, config, &mut pending).await;
-                if result.is_ok() {
-                    offline_since = None;
-                    spill_deadline = None;
-                } else {
-                    retry_deadline = Instant::now() + config.retry_interval;
-                }
-                let _ = waiter.send(result);
-            }
-            Ok(None) => {
-                shutdown(health, config, &mut pending);
-                return;
-            }
-            Err(_) => {}
-        }
-
-        let now = Instant::now();
-        if spill_deadline.is_some_and(|deadline| now >= deadline) {
-            if let Err(error) = spill_pending(health, config, &mut pending) {
-                tracing::warn!("lurkmoar: spool write failed: {error}");
-            }
-            spill_deadline = Some(now + config.spill_after);
-        }
-        if now >= retry_deadline {
-            if attempt_delivery(client, health, config, &mut pending)
-                .await
-                .is_ok()
-            {
-                offline_since = None;
-                spill_deadline = None;
-            } else {
-                // Measure backoff from completion of the failed attempt. Using the
-                // pre-attempt timestamp can collapse the delay to zero when the
-                // request itself takes at least one retry interval.
-                retry_deadline = Instant::now() + config.retry_interval;
-            }
-        }
-    }
-}
-
-fn shutdown(health: &Health, config: &Config, pending: &mut VecDeque<Batch>) {
-    if !pending.is_empty()
-        && let Err(error) = spill_pending(health, config, pending)
-    {
-        tracing::warn!("lurkmoar: shutdown spool failed: {error}");
-    }
-}
-
-async fn attempt_delivery(
-    client: &Client,
-    health: &Health,
-    config: &Config,
-    pending: &mut VecDeque<Batch>,
-) -> Result<(), Error> {
-    replay_spool(client, health, config).await?;
-    while let Some(batch) = pending.front() {
-        send_gzip(
-            client,
-            health,
-            &config.endpoint,
-            &batch.gzip,
-            batch.uncompressed_bytes,
-            batch.samples,
-            false,
-        )
-        .await?;
-        let _ = pending.pop_front();
-        set_pending(health, pending.len());
-    }
-    Ok(())
-}
-
-// Batch persisted frames into a bounded number of HTTP requests. Replaying
-// one small historical frame per HTTP request can take minutes after an
-// outage, starving fresh sccache_info heartbeats and breaking health checks.
-// Bound *both* number of spool files and uncompressed payload size.
-const REPLAY_MAX_FILES_PER_REQUEST: usize = 128;
-const REPLAY_MAX_UNCOMPRESSED_BYTES: usize = 512 * 1024;
-
-/// Submit all fully buffered files as one gzip document. On any delivery
-/// failure, leave every file intact so the next attempt can replay it.
-async fn send_replay_files(
-    client: &Client,
-    health: &Health,
-    config: &Config,
-    paths: &mut Vec<PathBuf>,
-    text: &mut String,
-    samples: &mut u64,
-) -> Result<(), Error> {
-    if paths.is_empty() {
-        return Ok(());
-    }
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
-    encoder.write_all(text.as_bytes())?;
-    let payload = Bytes::from(encoder.finish()?);
-    send_gzip(
+    let mut delivery = Delivery {
         client,
         health,
-        &config.endpoint,
-        &payload,
-        u64::try_from(text.len()).unwrap_or(u64::MAX),
-        *samples,
-        true,
-    )
-    .await?;
-    for path in paths.drain(..) {
-        fs::remove_file(path)?;
+        config,
+        pending: VecDeque::new(),
+        outage: None,
+        reported_drops: 0,
+    };
+    let mut shutdown = None;
+    // Historical backlog always precedes accepted live samples.
+    let _ = delivery.recover().await;
+    loop {
+        let command = if let Some(outage) = &delivery.outage
+            && shutdown.is_none()
+        {
+            let deadline = outage.deadline();
+            if deadline <= Instant::now() {
+                delivery.tick().await;
+                continue;
+            }
+            match tokio::time::timeout_at(deadline, inbox.recv()).await {
+                Ok(command) => command,
+                Err(_) => {
+                    delivery.tick().await;
+                    continue;
+                }
+            }
+        } else {
+            inbox.recv().await
+        };
+        match command {
+            Some(Command::Payload(first)) => delivery.accept(inbox.take_batch(first)).await,
+            Some(Command::Flush(waiter)) => {
+                let _ = waiter.send(delivery.flush().await);
+            }
+            Some(Command::Shutdown(waiter)) => {
+                if shutdown.is_none() {
+                    // Closing rejects concurrent submissions; all commands
+                    // accepted before closure are drained before completion.
+                    inbox.receiver.close();
+                    shutdown = Some(waiter);
+                } else {
+                    let _ = waiter.send(Err(Error::Closed));
+                }
+            }
+            None => return (shutdown, delivery.finish()),
+        }
     }
-    text.clear();
-    *samples = 0;
+}
+
+// A zero atomic value means no backlog. Encode an epoch timestamp as one so
+// even data timestamped at the epoch can have an accurate age.
+fn encode_age(timestamp_ms: Option<u64>) -> u64 {
+    timestamp_ms.map_or(0, |timestamp| timestamp / 1000 + 1)
+}
+
+fn refresh_spool(health: &Health, store: Option<&spool::Store>) -> Result<(), Error> {
+    let files = store
+        .map(spool::Store::files)
+        .transpose()?
+        .unwrap_or_default();
+    record_spool_inventory(health, &files);
     Ok(())
+}
+
+fn record_spool_inventory(health: &Health, files: &[spool::Entry]) {
+    health.spool_bytes.store(
+        files
+            .iter()
+            .fold(0_u64, |sum, entry| sum.saturating_add(entry.bytes)),
+        Ordering::Relaxed,
+    );
+    health.oldest_spool_unixtime.store(
+        encode_age(files.first().map(|entry| entry.timestamp_ms)),
+        Ordering::Relaxed,
+    );
+}
+
+fn encode_batch(payloads: Vec<QueuedPayload>) -> Result<Batch, Error> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+    let mut scratch = String::new();
+    let mut samples = 0_u64;
+    let mut uncompressed_bytes = 0_u64;
+    let mut oldest_ms = u64::MAX;
+    let mut permits = Vec::with_capacity(payloads.len());
+    for QueuedPayload { payload, permit } in payloads {
+        oldest_ms = oldest_ms.min(payload.timestamp_ms());
+        let (text, count) = match &payload {
+            Payload::PrometheusText { text, samples, .. } => (text.as_ref(), *samples),
+            Payload::Sample {
+                series,
+                value,
+                timestamp_ms,
+            } => {
+                scratch.clear();
+                metric::render_sample(&mut scratch, series, *value, *timestamp_ms);
+                (scratch.as_str(), 1)
+            }
+        };
+        encoder.write_all(text.as_bytes())?;
+        uncompressed_bytes =
+            uncompressed_bytes.saturating_add(u64::try_from(text.len()).unwrap_or(u64::MAX));
+        samples = samples.saturating_add(count);
+        permits.push(permit);
+    }
+    Ok(Batch {
+        data: Encoded {
+            gzip: Bytes::from(encoder.finish()?),
+            uncompressed_bytes,
+            samples,
+        },
+        oldest_ms,
+        _permits: permits,
+    })
+}
+
+// Validate gzip CRC/length and count lines without materializing decompressed
+// data. The producer emits one newline per sample. Gzip permits concatenated
+// members (RFC 1952); Liberta/VictoriaMetrics use a multistream reader.
+#[derive(Default)]
+struct SampleCount(u64);
+
+impl Write for SampleCount {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.0 = self.0.saturating_add(
+            u64::try_from(data.iter().filter(|&&byte| byte == b'\n').count()).unwrap_or(u64::MAX),
+        );
+        Ok(data.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn inspect_gzip(gzip: &[u8]) -> io::Result<(u64, u64)> {
+    if gzip.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "empty gzip frame",
+        ));
+    }
+    let mut count = SampleCount::default();
+    let bytes = io::copy(&mut MultiGzDecoder::new(gzip), &mut count)?;
+    Ok((bytes, count.0))
+}
+
+struct ReplayFile {
+    path: PathBuf,
+    dropped: u64,
+}
+
+#[derive(Default)]
+struct ReplayBatch {
+    files: Vec<ReplayFile>,
+    gzip: Vec<u8>,
+    uncompressed_bytes: u64,
+    samples: u64,
+}
+
+impl ReplayBatch {
+    fn read(path: PathBuf) -> Result<Self, Error> {
+        let contents = fs::read(&path)?;
+        let mut batch = Self::default();
+        let mut dropped = 0_u64;
+        match spool::decode(&contents) {
+            Ok(frames) => {
+                for frame in frames {
+                    match frame.and_then(|frame| inspect_gzip(frame).map(|stats| (frame, stats))) {
+                        Ok((frame, (bytes, samples))) => {
+                            batch.gzip.extend_from_slice(frame);
+                            batch.uncompressed_bytes =
+                                batch.uncompressed_bytes.saturating_add(bytes);
+                            batch.samples = batch.samples.saturating_add(samples);
+                        }
+                        Err(error) => {
+                            tracing::warn!(path = %path.display(), %error, "lurkmoar: corrupt spool frame; preserving valid frames");
+                            dropped = dropped.saturating_add(1);
+                        }
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(path = %path.display(), %error, "lurkmoar: corrupt spool file header");
+                dropped = 1;
+            }
+        }
+        batch.files.push(ReplayFile { path, dropped });
+        Ok(batch)
+    }
+
+    fn append(&mut self, mut other: Self) {
+        self.files.append(&mut other.files);
+        self.gzip.append(&mut other.gzip);
+        self.uncompressed_bytes = self
+            .uncompressed_bytes
+            .saturating_add(other.uncompressed_bytes);
+        self.samples = self.samples.saturating_add(other.samples);
+    }
+}
+
+const REPLAY_MAX_FILES: usize = 128;
+
+async fn send_replay_batch(
+    client: &Client,
+    health: &Health,
+    config: &Config,
+    batch: ReplayBatch,
+) -> Result<(), Error> {
+    let ReplayBatch {
+        files,
+        gzip,
+        uncompressed_bytes,
+        samples,
+    } = batch;
+    if !gzip.is_empty() {
+        let data = Encoded {
+            gzip: Bytes::from(gzip),
+            uncompressed_bytes,
+            samples,
+        };
+        send_gzip(client, health, &config.endpoint, &data, true).await?;
+    }
+    // Only acknowledge the source files after the complete grouped HTTP
+    // request succeeds. If removal fails midway, the remaining files replay
+    // at least once. Account corrupt frames only when their file is removed.
+    let removal = files.into_iter().try_for_each(|file| {
+        fs::remove_file(file.path)?;
+        let _ = health
+            .dropped_batches_total
+            .fetch_add(file.dropped, Ordering::Relaxed);
+        Ok::<(), io::Error>(())
+    });
+    let refresh = refresh_spool(health, config.spool.as_ref());
+    if let Err(error) = removal {
+        if let Err(refresh_error) = refresh {
+            tracing::warn!(%refresh_error, "lurkmoar: cannot refresh spool after partial acknowledgement");
+        }
+        return Err(error.into());
+    }
+    refresh
 }
 
 async fn replay_spool(client: &Client, health: &Health, config: &Config) -> Result<(), Error> {
-    let Some(directory) = config.spool_dir.as_deref() else {
+    let Some(store) = &config.spool else {
         return Ok(());
     };
-    let mut paths = Vec::new();
-    let mut text = String::new();
-    let mut samples = 0_u64;
-    for path in spool::files(directory)? {
-        let contents = fs::read(&path)?;
-        let batches = match spool::decode(&contents) {
-            Ok(batches) => batches,
+    let mut batch = ReplayBatch::default();
+    let entries = store.files()?;
+    record_spool_inventory(health, &entries);
+    for entry in entries {
+        let file = match ReplayBatch::read(entry.path) {
+            Ok(file) => file,
             Err(error) => {
-                tracing::warn!(
-                    "lurkmoar: discarding corrupt spool {}: {error}",
-                    path.display()
-                );
-                fs::remove_file(&path)?;
-                continue;
+                if !batch.files.is_empty() {
+                    send_replay_batch(client, health, config, batch).await?;
+                }
+                return Err(error);
             }
         };
-        let mut file_text = String::new();
-        let mut file_samples = 0_u64;
-        for batch in batches {
-            let mut decoder = GzDecoder::new(batch);
-            let _ = decoder.read_to_string(&mut file_text)?;
-        }
-        for line in file_text.lines() {
-            if !line.is_empty() {
-                file_samples = file_samples.saturating_add(1);
-            }
-        }
-        if !paths.is_empty()
-            && (paths.len() >= REPLAY_MAX_FILES_PER_REQUEST
-                || text.len().saturating_add(file_text.len()) > REPLAY_MAX_UNCOMPRESSED_BYTES)
+        if !batch.files.is_empty()
+            && (batch.files.len() >= REPLAY_MAX_FILES
+                || batch
+                    .uncompressed_bytes
+                    .saturating_add(file.uncompressed_bytes)
+                    > REQUEST_TARGET_BYTES as u64)
         {
-            send_replay_files(client, health, config, &mut paths, &mut text, &mut samples).await?;
+            send_replay_batch(client, health, config, std::mem::take(&mut batch)).await?;
         }
-        text.push_str(&file_text);
-        samples = samples.saturating_add(file_samples);
-        paths.push(path);
-        if paths.len() >= REPLAY_MAX_FILES_PER_REQUEST
-            || text.len() >= REPLAY_MAX_UNCOMPRESSED_BYTES
+        batch.append(file);
+        if batch.files.len() >= REPLAY_MAX_FILES
+            || batch.uncompressed_bytes >= REQUEST_TARGET_BYTES as u64
         {
-            send_replay_files(client, health, config, &mut paths, &mut text, &mut samples).await?;
+            send_replay_batch(client, health, config, std::mem::take(&mut batch)).await?;
         }
     }
-    send_replay_files(client, health, config, &mut paths, &mut text, &mut samples).await?;
-    update_spool_bytes(health, Some(directory));
-    Ok(())
-}
-
-fn spill_pending(
-    health: &Health,
-    config: &Config,
-    pending: &mut VecDeque<Batch>,
-) -> Result<(), Error> {
-    let Some(directory) = config.spool_dir.as_deref() else {
-        return Ok(());
-    };
-    if pending.is_empty() {
-        return Ok(());
+    if !batch.files.is_empty() {
+        send_replay_batch(client, health, config, batch).await?;
     }
-    let encoded = spool::encode(pending.iter().map(|batch| batch.gzip.as_ref()));
-    let existing = spool::size(directory)?;
-    let encoded_len = u64::try_from(encoded.len()).unwrap_or(u64::MAX);
-    if existing.saturating_add(encoded_len) > config.spool_max_bytes {
-        let _ = health.dropped_batches_total.fetch_add(
-            u64::try_from(pending.len()).unwrap_or(u64::MAX),
-            Ordering::Relaxed,
-        );
-        pending.clear();
-        set_pending(health, 0);
-        update_spool_bytes(health, Some(directory));
-        return Ok(());
-    }
-    let _ = spool::write(directory, unix_millis(), &encoded)?;
-    pending.clear();
-    set_pending(health, 0);
-    update_spool_bytes(health, Some(directory));
     Ok(())
 }
 
 async fn send_gzip(
     client: &Client,
     health: &Health,
-    endpoint: &str,
-    body: &Bytes,
-    uncompressed_bytes: u64,
-    samples: u64,
+    endpoint: &Uri,
+    data: &Encoded,
     replayed: bool,
 ) -> Result<(), Error> {
     let _ = health.attempts_total.fetch_add(1, Ordering::Relaxed);
     let started = Instant::now();
     let result = client
-        .post(endpoint)
+        .post(endpoint.clone())
         .header("Content-Type", "text/plain; version=0.0.4")
         .header("Content-Encoding", "gzip")
-        .body(Bytes::clone(body))
+        .body(Bytes::clone(&data.gzip))
         .send()
         .await
-        .map_err(|error| Error::Delivery(error.without_uri().to_string()))
+        .map_err(|error| Error::Transport(error.without_uri()))
         .and_then(|response| {
             if response.status().is_success() {
                 Ok(())
             } else {
-                Err(Error::Delivery(format!("HTTP {}", response.status())))
+                Err(Error::HttpStatus(response.status()))
             }
         });
     let micros = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
@@ -478,14 +737,14 @@ async fn send_gzip(
             let _ = health.sent_batches_total.fetch_add(1, Ordering::Relaxed);
             let _ = health
                 .sent_samples_total
-                .fetch_add(samples, Ordering::Relaxed);
+                .fetch_add(data.samples, Ordering::Relaxed);
             let _ = health.sent_compressed_bytes_total.fetch_add(
-                u64::try_from(body.len()).unwrap_or(u64::MAX),
+                u64::try_from(data.gzip.len()).unwrap_or(u64::MAX),
                 Ordering::Relaxed,
             );
             let _ = health
                 .sent_uncompressed_bytes_total
-                .fetch_add(uncompressed_bytes, Ordering::Relaxed);
+                .fetch_add(data.uncompressed_bytes, Ordering::Relaxed);
             if replayed {
                 let _ = health
                     .replayed_batches_total
@@ -503,287 +762,15 @@ async fn send_gzip(
     }
 }
 
-fn record_encoded(health: &Health, batch: &Batch) {
+fn record_encoded(health: &Health, data: &Encoded) {
     let _ = health
         .encoded_samples_total
-        .fetch_add(batch.samples, Ordering::Relaxed);
+        .fetch_add(data.samples, Ordering::Relaxed);
     let _ = health.encoded_compressed_bytes_total.fetch_add(
-        u64::try_from(batch.gzip.len()).unwrap_or(u64::MAX),
+        u64::try_from(data.gzip.len()).unwrap_or(u64::MAX),
         Ordering::Relaxed,
     );
     let _ = health
         .encoded_uncompressed_bytes_total
-        .fetch_add(batch.uncompressed_bytes, Ordering::Relaxed);
-}
-
-fn encode_batch(payloads: &[Payload], static_labels: &[(String, String)]) -> Result<Batch, Error> {
-    let mut text = String::new();
-    let mut samples = 0_u64;
-    for payload in payloads {
-        match payload {
-            Payload::PrometheusText {
-                text: source,
-                timestamp_ms,
-            } => {
-                for line in source.lines() {
-                    if line.is_empty() || line.starts_with('#') {
-                        continue;
-                    }
-                    let Some(space) = sample_value_separator(line) else {
-                        continue;
-                    };
-                    let metric = add_labels(&line[..space], static_labels);
-                    let Some(value) = line[space..].split_whitespace().next() else {
-                        continue;
-                    };
-                    text.push_str(&metric);
-                    text.push(' ');
-                    text.push_str(value);
-                    text.push(' ');
-                    text.push_str(&timestamp_ms.to_string());
-                    text.push('\n');
-                    samples = samples.saturating_add(1);
-                }
-            }
-            Payload::Sample {
-                name,
-                value,
-                labels,
-                timestamp_ms,
-            } => {
-                let mut combined = static_labels.to_vec();
-                for (key, value) in labels {
-                    if let Some((_, existing)) = combined
-                        .iter_mut()
-                        .find(|(existing_key, _)| existing_key == key)
-                    {
-                        existing.clone_from(value);
-                    } else {
-                        combined.push((key.clone(), value.clone()));
-                    }
-                }
-                text.push_str(&add_labels(name, &combined));
-                text.push(' ');
-                text.push_str(&render_value(*value));
-                text.push(' ');
-                text.push_str(&timestamp_ms.to_string());
-                text.push('\n');
-                samples = samples.saturating_add(1);
-            }
-        }
-    }
-    let uncompressed_bytes = u64::try_from(text.len()).unwrap_or(u64::MAX);
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
-    encoder.write_all(text.as_bytes())?;
-    let gzip = Bytes::from(encoder.finish()?);
-    Ok(Batch {
-        gzip,
-        uncompressed_bytes,
-        samples,
-    })
-}
-
-fn sample_value_separator(line: &str) -> Option<usize> {
-    let mut quoted = false;
-    let mut escaped = false;
-    for (index, byte) in line.bytes().enumerate() {
-        if quoted {
-            if escaped {
-                escaped = false;
-                continue;
-            }
-            match byte {
-                b'\\' => escaped = true,
-                b'"' => quoted = false,
-                _ => {}
-            }
-            continue;
-        }
-        match byte {
-            b'"' => quoted = true,
-            b' ' | b'\t' => return Some(index),
-            _ => {}
-        }
-    }
-    None
-}
-
-fn add_labels(metric: &str, labels: &[(String, String)]) -> String {
-    if labels.is_empty() {
-        return metric.to_owned();
-    }
-    let rendered = labels
-        .iter()
-        .map(|(key, value)| format!("{key}=\"{}\"", escape_label_value(value)))
-        .collect::<Vec<_>>()
-        .join(",");
-    metric.strip_suffix('}').map_or_else(
-        || format!("{metric}{{{rendered}}}"),
-        |prefix| {
-            if prefix.ends_with('{') {
-                format!("{prefix}{rendered}}}")
-            } else {
-                format!("{prefix},{rendered}}}")
-            }
-        },
-    )
-}
-
-fn escape_label_value(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace('\n', "\\n")
-        .replace('"', "\\\"")
-}
-
-fn render_value(value: f64) -> String {
-    if value.is_nan() {
-        "NaN".into()
-    } else if value == f64::INFINITY {
-        "+Inf".into()
-    } else if value == f64::NEG_INFINITY {
-        "-Inf".into()
-    } else {
-        value.to_string()
-    }
-}
-
-fn set_pending(health: &Health, value: usize) {
-    health.pending_batches.store(value, Ordering::Relaxed);
-    if value > 0 {
-        let _ = health.oldest_pending_unixtime.compare_exchange(
-            0,
-            unix_seconds(),
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        );
-    }
-}
-
-fn update_spool_bytes(health: &Health, directory: Option<&std::path::Path>) {
-    let bytes = directory
-        .and_then(|path| spool::size(path).ok())
-        .unwrap_or(0);
-    health.spool_bytes.store(bytes, Ordering::Relaxed);
-    if bytes > 0 {
-        let _ = health.oldest_pending_unixtime.compare_exchange(
-            0,
-            unix_seconds(),
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        );
-    } else if health.pending_batches.load(Ordering::Relaxed) == 0 {
-        health.oldest_pending_unixtime.store(0, Ordering::Relaxed);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{Payload, add_labels, encode_batch, sample_value_separator};
-    use flate2::read::GzDecoder;
-    use std::io::Read;
-
-    fn decode_gzip(bytes: &[u8]) -> Result<String, Box<dyn std::error::Error>> {
-        let mut decoder = GzDecoder::new(bytes);
-        let mut text = String::new();
-        let _ = decoder.read_to_string(&mut text)?;
-        Ok(text)
-    }
-
-    #[test]
-    fn text_is_timestamped_and_static_labels_are_added() -> Result<(), Box<dyn std::error::Error>> {
-        let payload = Payload::PrometheusText {
-            text: "# HELP x demo\nx{a=\"b\"} 1.5\ny 2\n".into(),
-            timestamp_ms: 1_234,
-        };
-        let gzip = encode_batch(&[payload], &[("instance".into(), "host-a".into())])?;
-        assert_eq!(
-            decode_gzip(&gzip.gzip)?,
-            "x{a=\"b\",instance=\"host-a\"} 1.5 1234\ny{instance=\"host-a\"} 2 1234\n"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn labels_are_escaped() {
-        assert_eq!(
-            add_labels("x", &[("a".into(), "q\"\\\n".into())]),
-            "x{a=\"q\\\"\\\\\\n\"}"
-        );
-    }
-    #[test]
-    fn sample_separator_ignores_whitespace_inside_labels() {
-        let line = r#"x{a="hello world",b="q\" z"} 1"#;
-        assert_eq!(sample_value_separator(line), line.rfind(" 1"));
-        assert_eq!(sample_value_separator("plain\t2"), Some(5));
-    }
-
-    #[test]
-    fn text_labels_with_spaces_and_escapes_survive_timestamping()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let payload = Payload::PrometheusText {
-            text: concat!(
-                "uname_info{version=\"#1 SMP PREEMPT_DYNAMIC Thu Oct 1\",note=\"a\\\" b\\\\ c\"} 1\n",
-                "reason_info{reason=\"multiple input files\"} 3\n",
-            ).into(),
-            timestamp_ms: 1_234,
-        };
-        let gzip = encode_batch(&[payload], &[("instance".into(), "host-a".into())])?;
-        assert_eq!(
-            decode_gzip(&gzip.gzip)?,
-            concat!(
-                "uname_info{version=\"#1 SMP PREEMPT_DYNAMIC Thu Oct 1\",note=\"a\\\" b\\\\ c\",instance=\"host-a\"} 1 1234\n",
-                "reason_info{reason=\"multiple input files\",instance=\"host-a\"} 3 1234\n",
-            )
-        );
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod batch_tests {
-    use super::{Command, LIVE_MAX_PAYLOADS_PER_REQUEST, Payload, take_ready_batch};
-    use std::sync::mpsc;
-
-    fn payload(index: usize) -> Payload {
-        Payload::PrometheusText {
-            text: index.to_string(),
-            timestamp_ms: 0,
-        }
-    }
-
-    #[test]
-    fn ready_batches_are_bounded_and_do_not_consume_after_flush()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        let (flush, waiter) = mpsc::sync_channel(1);
-        for index in 1..=LIVE_MAX_PAYLOADS_PER_REQUEST {
-            sender.send(Command::Payload(payload(index)))?;
-        }
-        sender.send(Command::Flush(flush))?;
-        sender.send(Command::Payload(payload(LIVE_MAX_PAYLOADS_PER_REQUEST + 1)))?;
-        drop(sender);
-
-        let first = take_ready_batch(payload(0), &mut receiver);
-        assert_eq!(first.payloads.len(), LIVE_MAX_PAYLOADS_PER_REQUEST);
-        assert!(first.flush.is_none());
-        assert!(!first.disconnected);
-        let Command::Payload(next) = receiver.try_recv()? else {
-            return Err("expected remaining payload before flush".into());
-        };
-        let second = take_ready_batch(next, &mut receiver);
-        assert_eq!(second.payloads.len(), 1);
-        let Some(flush) = second.flush else {
-            return Err("expected flush barrier".into());
-        };
-        flush.send(Ok(()))?;
-        waiter.recv()??;
-        let Command::Payload(last) = receiver.try_recv()? else {
-            return Err("expected payload after flush".into());
-        };
-        let final_batch = take_ready_batch(last, &mut receiver);
-        assert_eq!(final_batch.payloads.len(), 1);
-        assert!(final_batch.disconnected);
-        Ok(())
-    }
+        .fetch_add(data.uncompressed_bytes, Ordering::Relaxed);
 }
