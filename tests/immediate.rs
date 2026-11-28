@@ -108,6 +108,7 @@ fn change_is_sent_without_a_batch_timer() -> Result<(), Box<dyn std::error::Erro
     assert!(body.starts_with("demo_state{instance=\"test-host\",slot=\"7\"} 3 "));
     client.flush()?;
     let health = client.health();
+    drop(client);
     assert_eq!(health.sent_batches_total, 1);
     assert_eq!(health.sent_samples_total, 1);
     assert!(health.sent_compressed_bytes_total > 0);
@@ -115,6 +116,7 @@ fn change_is_sent_without_a_batch_timer() -> Result<(), Box<dyn std::error::Erro
     assert_eq!(health.encoded_samples_total, 1);
     assert!(health.last_request_duration_microseconds > 0);
     assert!(!gauge.set(3.0)?);
+    drop(gauge);
     server.join().map_err(|_| "server thread panicked")?;
     Ok(())
 }
@@ -162,6 +164,7 @@ fn outage_spills_then_replays() -> Result<(), Box<dyn std::error::Error + Send +
     assert_eq!(health.sent_samples_total, 1);
     server.join().map_err(|_| "server thread panicked")?;
     client.shutdown()?;
+    drop(client);
     Ok(())
 }
 
@@ -211,6 +214,10 @@ fn retry_interval_starts_after_failed_attempt_finishes()
         "retry started only {gap:?} after the previous failed attempt completed"
     );
     server.join().map_err(|_| "server thread panicked")??;
+    assert!(matches!(
+        client.shutdown(),
+        Err(lurkmoar::Error::Dropped { batches: 1 })
+    ));
     Ok(())
 }
 
@@ -261,6 +268,7 @@ fn historical_backlog_replays_in_bounded_multi_file_requests()
     assert_eq!(std::fs::read_dir(spool_dir.path())?.count(), 1); // persistent advisory lock
     server.join().map_err(|_| "server thread panicked")??;
     client.shutdown()?;
+    drop(client);
     Ok(())
 }
 
@@ -285,6 +293,7 @@ fn redirected_ingestion_is_not_acknowledged() -> Result<(), Box<dyn std::error::
     client.sample("redirect_test", 1.0, std::iter::empty::<(&str, &str)>())?;
     assert!(client.flush().is_err());
     let health = client.health();
+    drop(client);
     assert_eq!(health.sent_samples_total, 0);
     assert_eq!(health.failures_total, 2);
     server.join().map_err(|_| "server thread panicked")??;
@@ -332,6 +341,7 @@ fn ram_only_backlog_is_bounded_and_recovers() -> TestResult {
     assert_eq!(health.pending_batches, 0);
     assert_eq!(health.oldest_pending_age_seconds, 0);
     client.shutdown()?;
+    drop(client);
     Ok(())
 }
 
@@ -346,6 +356,7 @@ fn exclusive_spool_lock_is_released_by_shutdown() -> TestResult {
         first.sample("x", 1.0, std::iter::empty::<(&str, &str)>()),
         Err(lurkmoar::Error::Closed)
     ));
+    drop(first);
     builder.build()?.shutdown()?;
     Ok(())
 }
@@ -392,6 +403,7 @@ fn corrupt_spool_frame_does_not_block_valid_frames_or_hide_loss() -> TestResult 
     assert_eq!(health.spool_bytes, 0);
     client.flush()?;
     client.shutdown()?;
+    drop(client);
     Ok(())
 }
 
