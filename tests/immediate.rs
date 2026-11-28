@@ -1,14 +1,47 @@
 use flate2::Compression;
-use flate2::read::GzDecoder;
+use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
 use lurkmoar::ClientBuilder;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-fn read_request(mut stream: TcpStream) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+type TestResult<T = ()> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+struct TestDir(PathBuf);
+
+impl TestDir {
+    fn new() -> TestResult<Self> {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "lurkmoar-test-{}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&path)?;
+        Ok(Self(path))
+    }
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        if let Err(error) = std::fs::remove_dir_all(&self.0) {
+            eprintln!("failed to remove test directory: {error}");
+        }
+    }
+}
+
+fn read_body(stream: &mut TcpStream) -> TestResult<Vec<u8>> {
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
     let mut received = Vec::new();
     let mut buffer = [0_u8; 4096];
@@ -39,8 +72,12 @@ fn read_request(mut stream: TcpStream) -> Result<String, Box<dyn std::error::Err
         }
         received.extend_from_slice(&buffer[..count]);
     }
-    let body = &received[header_end..header_end + content_length];
-    let mut decoder = GzDecoder::new(body);
+    Ok(received[header_end..header_end + content_length].to_vec())
+}
+
+fn read_request(mut stream: TcpStream) -> TestResult<String> {
+    let body = read_body(&mut stream)?;
+    let mut decoder = MultiGzDecoder::new(body.as_slice());
     let mut text = String::new();
     let _ = decoder.read_to_string(&mut text)?;
     stream
@@ -71,6 +108,7 @@ fn change_is_sent_without_a_batch_timer() -> Result<(), Box<dyn std::error::Erro
     assert!(body.starts_with("demo_state{instance=\"test-host\",slot=\"7\"} 3 "));
     client.flush()?;
     let health = client.health();
+    drop(client);
     assert_eq!(health.sent_batches_total, 1);
     assert_eq!(health.sent_samples_total, 1);
     assert!(health.sent_compressed_bytes_total > 0);
@@ -78,6 +116,7 @@ fn change_is_sent_without_a_batch_timer() -> Result<(), Box<dyn std::error::Erro
     assert_eq!(health.encoded_samples_total, 1);
     assert!(health.last_request_duration_microseconds > 0);
     assert!(!gauge.set(3.0)?);
+    drop(gauge);
     server.join().map_err(|_| "server thread panicked")?;
     Ok(())
 }
@@ -87,20 +126,13 @@ fn outage_spills_then_replays() -> Result<(), Box<dyn std::error::Error + Send +
     let probe = TcpListener::bind("127.0.0.1:0")?;
     let address = probe.local_addr()?;
     drop(probe);
-    let spool_dir = std::env::temp_dir().join(format!(
-        "lurkmoar-test-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&spool_dir)?;
+    let spool_dir = TestDir::new()?;
 
     let client = ClientBuilder::new(format!("http://{address}/import"))
         .retry_interval(Duration::from_millis(20))
         .spill_after(Duration::from_millis(50))
         .timeout(Duration::from_millis(20))
-        .spool(&spool_dir, 1024 * 1024)
+        .spool(spool_dir.path(), 1024 * 1024)
         .build()?;
     client.sample("rare_change", 1.0, std::iter::empty::<(&str, &str)>())?;
 
@@ -131,41 +163,13 @@ fn outage_spills_then_replays() -> Result<(), Box<dyn std::error::Error + Send +
     assert_eq!(health.replayed_batches_total, 1);
     assert_eq!(health.sent_samples_total, 1);
     server.join().map_err(|_| "server thread panicked")?;
-    std::fs::remove_dir_all(&spool_dir)?;
+    client.shutdown()?;
+    drop(client);
     Ok(())
 }
 
-fn consume_request(stream: &mut TcpStream) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-    let mut received = Vec::new();
-    let mut buffer = [0_u8; 4096];
-    let header_end = loop {
-        let count = stream.read(&mut buffer)?;
-        if count == 0 {
-            return Err("connection closed before headers completed".into());
-        }
-        received.extend_from_slice(&buffer[..count]);
-        if let Some(position) = received.windows(4).position(|window| window == b"\r\n\r\n") {
-            break position + 4;
-        }
-    };
-    let headers = std::str::from_utf8(&received[..header_end])?;
-    let content_length = headers
-        .lines()
-        .find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("content-length")
-                .then(|| value.trim().parse::<usize>().ok())
-                .flatten()
-        })
-        .ok_or("missing content-length")?;
-    while received.len() - header_end < content_length {
-        let count = stream.read(&mut buffer)?;
-        if count == 0 {
-            return Err("connection closed before body completed".into());
-        }
-        received.extend_from_slice(&buffer[..count]);
-    }
+fn consume_request(stream: &mut TcpStream) -> TestResult {
+    drop(read_body(stream)?);
     Ok(())
 }
 
@@ -210,20 +214,18 @@ fn retry_interval_starts_after_failed_attempt_finishes()
         "retry started only {gap:?} after the previous failed attempt completed"
     );
     server.join().map_err(|_| "server thread panicked")??;
+    assert!(matches!(
+        client.shutdown(),
+        Err(lurkmoar::Error::Dropped { batches: 1 })
+    ));
+    drop(client);
     Ok(())
 }
 
 #[test]
 fn historical_backlog_replays_in_bounded_multi_file_requests()
 -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let spool_dir = std::env::temp_dir().join(format!(
-        "lurkmoar-backlog-test-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&spool_dir)?;
+    let spool_dir = TestDir::new()?;
     for index in 0..130_u32 {
         let mut gzip = GzEncoder::new(Vec::new(), Compression::fast());
         gzip.write_all(
@@ -233,7 +235,10 @@ fn historical_backlog_replays_in_bounded_multi_file_requests()
         let mut contents = b"LURKMR01".to_vec();
         contents.extend_from_slice(&u32::try_from(compressed.len())?.to_le_bytes());
         contents.extend_from_slice(&compressed);
-        std::fs::write(spool_dir.join(format!("{index:020}.spool")), contents)?;
+        std::fs::write(
+            spool_dir.path().join(format!("{index:020}.spool")),
+            contents,
+        )?;
     }
 
     let listener = TcpListener::bind("127.0.0.1:0")?;
@@ -249,7 +254,7 @@ fn historical_backlog_replays_in_bounded_multi_file_requests()
         Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
     });
     let client = ClientBuilder::new(format!("http://{address}/import"))
-        .spool(&spool_dir, 1024 * 1024)
+        .spool(spool_dir.path(), 1024 * 1024)
         .build()?;
     client.flush()?;
     let bodies = receiver.recv_timeout(Duration::from_secs(5))?;
@@ -261,9 +266,10 @@ fn historical_backlog_replays_in_bounded_multi_file_requests()
     assert_eq!(client.health().sent_samples_total, 130);
     assert_eq!(client.health().replayed_batches_total, 2);
     assert_eq!(client.health().spool_bytes, 0);
-    assert_eq!(std::fs::read_dir(&spool_dir)?.count(), 0);
+    assert_eq!(std::fs::read_dir(spool_dir.path())?.count(), 1); // persistent advisory lock
     server.join().map_err(|_| "server thread panicked")??;
-    std::fs::remove_dir(&spool_dir)?;
+    client.shutdown()?;
+    drop(client);
     Ok(())
 }
 
@@ -288,8 +294,142 @@ fn redirected_ingestion_is_not_acknowledged() -> Result<(), Box<dyn std::error::
     client.sample("redirect_test", 1.0, std::iter::empty::<(&str, &str)>())?;
     assert!(client.flush().is_err());
     let health = client.health();
+    drop(client);
     assert_eq!(health.sent_samples_total, 0);
     assert_eq!(health.failures_total, 2);
+    server.join().map_err(|_| "server thread panicked")??;
+    Ok(())
+}
+
+#[test]
+fn ram_only_backlog_is_bounded_and_recovers() -> TestResult {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    let (failed, wait_failed) = mpsc::sync_channel(1);
+    let (resume, wait_resume) = mpsc::sync_channel(1);
+    let server = thread::spawn(move || -> TestResult<String> {
+        let (mut stream, _) = listener.accept()?;
+        consume_request(&mut stream)?;
+        stream.write_all(
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )?;
+        failed.send(())?;
+        wait_resume.recv_timeout(Duration::from_secs(5))?;
+        let (stream, _) = listener.accept()?;
+        read_request(stream)
+    });
+    let client = ClientBuilder::new(format!("http://{address}/import"))
+        .retry_interval(Duration::from_secs(60))
+        .backlog_limits(1, 4096)
+        .build()?;
+    let counter = client.counter("events", std::iter::empty::<(&str, &str)>())?;
+    let _ = counter.inc()?;
+    wait_failed.recv_timeout(Duration::from_secs(5))?;
+    assert!(matches!(counter.inc(), Err(lurkmoar::Error::Backpressure)));
+    assert_eq!(counter.get()?.to_bits(), 1.0_f64.to_bits());
+    assert_eq!(client.health().outstanding_payloads, 1);
+    resume.send(())?;
+    client.flush()?;
+    assert!(
+        server
+            .join()
+            .map_err(|_| "server thread panicked")??
+            .starts_with("events 1 ")
+    );
+    let health = client.health();
+    assert_eq!(health.outstanding_payloads, 0);
+    assert_eq!(health.outstanding_bytes, 0);
+    assert_eq!(health.pending_batches, 0);
+    assert_eq!(health.oldest_pending_age_seconds, 0);
+    client.shutdown()?;
+    drop(client);
+    Ok(())
+}
+
+#[test]
+fn exclusive_spool_lock_is_released_by_shutdown() -> TestResult {
+    let directory = TestDir::new()?;
+    let builder = ClientBuilder::new("http://127.0.0.1:1/import").spool(directory.path(), 4096);
+    let first = builder.clone().build()?;
+    assert!(builder.clone().build().is_err());
+    first.shutdown()?;
+    assert!(matches!(
+        first.sample("x", 1.0, std::iter::empty::<(&str, &str)>()),
+        Err(lurkmoar::Error::Closed)
+    ));
+    drop(first);
+    builder.build()?.shutdown()?;
+    Ok(())
+}
+
+#[test]
+fn corrupt_spool_frame_does_not_block_valid_frames_or_hide_loss() -> TestResult {
+    let directory = TestDir::new()?;
+    let mut contents = b"LURKMR01".to_vec();
+    for input in ["first 1 1\n", "", "last 2 3\n"] {
+        let frame = if input.is_empty() {
+            b"not gzip".to_vec()
+        } else {
+            let mut gzip = GzEncoder::new(Vec::new(), Compression::fast());
+            gzip.write_all(input.as_bytes())?;
+            gzip.finish()?
+        };
+        contents.extend_from_slice(&u32::try_from(frame.len())?.to_le_bytes());
+        contents.extend_from_slice(&frame);
+    }
+    std::fs::write(
+        directory.path().join("00000000000000000001.spool"),
+        contents,
+    )?;
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    let server = thread::spawn(move || -> TestResult<String> {
+        let (stream, _) = listener.accept()?;
+        read_request(stream)
+    });
+    let client = ClientBuilder::new(format!("http://{address}/import"))
+        .spool(directory.path(), 4096)
+        .build()?;
+    assert!(matches!(
+        client.flush(),
+        Err(lurkmoar::Error::Dropped { batches: 1 })
+    ));
+    assert_eq!(
+        server.join().map_err(|_| "server thread panicked")??,
+        "first 1 1\nlast 2 3\n"
+    );
+    let health = client.health();
+    assert_eq!(health.dropped_batches_total, 1);
+    assert_eq!(health.sent_samples_total, 2);
+    assert_eq!(health.spool_bytes, 0);
+    client.flush()?;
+    client.shutdown()?;
+    drop(client);
+    Ok(())
+}
+
+#[test]
+fn shutdown_reports_unpersisted_work() -> TestResult {
+    let listener = TcpListener::bind("127.0.0.1:0")?;
+    let address = listener.local_addr()?;
+    let server = thread::spawn(move || -> TestResult {
+        let (mut stream, _) = listener.accept()?;
+        consume_request(&mut stream)?;
+        stream.write_all(
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )?;
+        Ok(())
+    });
+    let client = ClientBuilder::new(format!("http://{address}/import"))
+        .retry_interval(Duration::from_secs(60))
+        .build()?;
+    client.sample("x", 1.0, std::iter::empty::<(&str, &str)>())?;
+    assert!(matches!(
+        client.shutdown(),
+        Err(lurkmoar::Error::Dropped { batches: 1 })
+    ));
+    assert_eq!(client.health().dropped_batches_total, 1);
+    assert_eq!(client.health().outstanding_payloads, 0);
     server.join().map_err(|_| "server thread panicked")??;
     Ok(())
 }
