@@ -14,4 +14,4 @@ permissions:
 
 jobs:
   strict-rust:
-    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@4f29271a2aa27bef1f34bd70407b0db3d39904a9 # main
+    uses: codeandsolder/rust-skills2/.github/workflows/strict-rust.yml@6e3473415ed6be9cf25869ddeac80304ddb5a34b # main
