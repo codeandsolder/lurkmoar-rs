@@ -22,14 +22,14 @@ use crate::{
 };
 
 #[derive(Debug)]
-pub(super) enum Payload {
+pub enum Payload {
     PrometheusText {
         text: Box<str>,
         samples: u64,
         timestamp_ms: u64,
     },
     Sample {
-        series: Arc<Series>,
+        series: Series,
         value: f64,
         timestamp_ms: u64,
     },
@@ -55,7 +55,7 @@ impl Payload {
 }
 
 #[derive(Debug)]
-pub(super) struct QueuedPayload {
+pub struct QueuedPayload {
     pub payload: Payload,
     pub permit: Permit,
 }
@@ -63,14 +63,14 @@ pub(super) struct QueuedPayload {
 type Waiter = mpsc::SyncSender<Result<(), Error>>;
 
 #[derive(Debug)]
-pub(super) enum Command {
+pub enum Command {
     Payload(QueuedPayload),
     Flush(Waiter),
     Shutdown(Waiter),
 }
 
 #[derive(Debug)]
-pub(super) struct Config {
+pub struct Config {
     pub endpoint: Uri,
     pub timeout: Duration,
     pub retry_interval: Duration,
@@ -93,7 +93,7 @@ struct Batch {
     _permits: Vec<Permit>,
 }
 
-pub(super) fn spawn(
+pub fn spawn(
     receiver: Receiver<Command>,
     health: Arc<Health>,
     config: Config,
@@ -440,12 +440,11 @@ async fn run(
                 delivery.tick().await;
                 continue;
             }
-            match tokio::time::timeout_at(deadline, inbox.recv()).await {
-                Ok(command) => command,
-                Err(_) => {
-                    delivery.tick().await;
-                    continue;
-                }
+            if let Ok(command) = tokio::time::timeout_at(deadline, inbox.recv()).await {
+                command
+            } else {
+                delivery.tick().await;
+                continue;
             }
         } else {
             inbox.recv().await
@@ -544,9 +543,9 @@ struct SampleCount(u64);
 
 impl Write for SampleCount {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-        self.0 = self.0.saturating_add(
-            u64::try_from(data.iter().filter(|&&byte| byte == b'\n').count()).unwrap_or(u64::MAX),
-        );
+        self.0 = self
+            .0
+            .saturating_add(data.iter().map(|&byte| u64::from(byte == b'\n')).sum());
         Ok(data.len())
     }
     fn flush(&mut self) -> io::Result<()> {
@@ -794,6 +793,13 @@ mod tests {
         }
     }
 
+    fn next_batch(
+        inbox: &mut Inbox,
+    ) -> Result<Vec<super::QueuedPayload>, Box<dyn std::error::Error>> {
+        let first = take_payload(inbox)?;
+        Ok(inbox.take_batch(first))
+    }
+
     #[test]
     fn batching_preserves_fifo_barriers_and_count_limit() -> Result<(), Box<dyn std::error::Error>>
     {
@@ -808,25 +814,23 @@ mod tests {
             receiver,
             deferred: None,
         };
-        let first = take_payload(&mut inbox)?;
-        let first = inbox.take_batch(first);
+        let first = next_batch(&mut inbox)?;
         assert_eq!(first.len(), LIVE_MAX_PAYLOADS);
         let encoded = encode_batch(first)?;
         assert_eq!(
             inspect_gzip(&encoded.data.gzip)?,
             (encoded.data.uncompressed_bytes, LIVE_MAX_PAYLOADS as u64)
         );
-        let second = take_payload(&mut inbox)?;
-        let second = inbox.take_batch(second);
+        let second = next_batch(&mut inbox)?;
         assert_eq!(second.len(), 1);
         let Some(Command::Flush(flush)) = inbox.deferred.take() else {
             return Err("expected flush barrier".into());
         };
         flush.send(Ok(()))?;
         waiter.recv()??;
-        let last = take_payload(&mut inbox)?;
-        assert_eq!(inbox.take_batch(last).len(), 1);
+        assert_eq!(next_batch(&mut inbox)?.len(), 1);
         assert!(inbox.receiver.try_recv().is_err());
+        drop(inbox);
         assert_eq!(client.health().outstanding_payloads, LIVE_MAX_PAYLOADS + 1);
         drop(encoded);
         drop(second);
@@ -848,11 +852,10 @@ mod tests {
             receiver,
             deferred: None,
         };
-        let first = take_payload(&mut inbox)?;
-        assert_eq!(inbox.take_batch(first).len(), 1);
+        assert_eq!(next_batch(&mut inbox)?.len(), 1);
         assert!(matches!(inbox.deferred, Some(Command::Payload(_))));
-        let second = take_payload(&mut inbox)?;
-        assert_eq!(inbox.take_batch(second).len(), 1);
+        assert_eq!(next_batch(&mut inbox)?.len(), 1);
+        drop(inbox);
         assert_eq!(client.health().outstanding_payloads, 0);
         Ok(())
     }

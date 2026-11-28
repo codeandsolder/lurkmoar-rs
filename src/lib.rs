@@ -28,17 +28,28 @@ const DEFAULT_SPOOL_MAX: u64 = 10 * 1024 * 1024;
 const DEFAULT_BACKLOG_PAYLOADS: usize = 4096;
 const DEFAULT_BACKLOG_BYTES: usize = 32 * 1024 * 1024;
 
+/// Configuration, admission, delivery or state failure.
 #[derive(Debug)]
 pub enum Error {
+    /// Invalid endpoint, timeout, labels or backlog configuration.
     InvalidConfig(String),
+    /// Invalid metric name, labels, value or text snapshot.
     InvalidMetric(String),
+    /// Filesystem, compression or thread initialization failure.
     Io(std::io::Error),
+    /// The delivery worker no longer accepts commands.
     Closed,
+    /// The bounded RAM backlog or command queue is full; retry later.
     Backpressure,
+    /// An individual payload cannot fit the configured admission budget.
     PayloadTooLarge { bytes: usize, limit: usize },
+    /// HTTP transport failed before receiving a successful response.
     Transport(wreq::Error),
+    /// The server did not acknowledge the request with a 2xx response.
     HttpStatus(wreq::StatusCode),
+    /// Previously admitted batches were lost since the preceding successful barrier.
     Dropped { batches: u64 },
+    /// An internal state invariant or synchronization operation failed.
     State(String),
 }
 
@@ -78,51 +89,73 @@ impl From<std::io::Error> for Error {
     }
 }
 
+/// Point-in-time observations of delivery health. Counters are process-local;
+/// concurrent updates may be reflected at slightly different instants.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HealthSnapshot {
+    /// HTTP requests attempted, including replay and retries.
     pub attempts_total: u64,
+    /// HTTP requests that did not receive a successful acknowledgement.
     pub failures_total: u64,
+    /// Admitted batches lost or corrupt spool frames discarded.
     pub dropped_batches_total: u64,
+    /// Payloads rejected by admission or worker closure.
     pub rejected_payloads_total: u64,
+    /// Admitted payloads not yet acknowledged, spooled or dropped.
     pub outstanding_payloads: usize,
+    /// Accounted bytes reserved by those payloads (not process RSS).
     pub outstanding_bytes: usize,
+    /// Successfully acknowledged HTTP requests.
     pub sent_batches_total: u64,
+    /// Samples in acknowledged requests, including replay.
     pub sent_samples_total: u64,
+    /// Compressed body bytes acknowledged by the server.
     pub sent_compressed_bytes_total: u64,
+    /// Uncompressed sample bytes in acknowledged requests.
     pub sent_uncompressed_bytes_total: u64,
+    /// Successfully acknowledged requests containing persisted data.
     pub replayed_batches_total: u64,
+    /// Samples compressed by this worker for live delivery.
     pub encoded_samples_total: u64,
+    /// Compressed bytes produced for live delivery.
     pub encoded_compressed_bytes_total: u64,
+    /// Uncompressed bytes encoded for live delivery.
     pub encoded_uncompressed_bytes_total: u64,
+    /// Cumulative elapsed time for successful and failed HTTP attempts.
     pub request_duration_microseconds_total: u64,
+    /// Elapsed time of the most recently completed HTTP attempt.
     pub last_request_duration_microseconds: u64,
+    /// Encoded batches awaiting acknowledgement in RAM.
     pub pending_batches: usize,
+    /// Bytes of published spool files awaiting acknowledgement.
     pub spool_bytes: u64,
+    /// Age of the oldest encoded RAM or persisted batch; zero when empty.
     pub oldest_pending_age_seconds: u64,
+    /// Unix seconds of the most recent acknowledgement, or zero before one.
     pub last_success_unixtime: u64,
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct Health {
-    pub(crate) attempts_total: AtomicU64,
-    pub(crate) failures_total: AtomicU64,
-    pub(crate) dropped_batches_total: AtomicU64,
-    pub(crate) rejected_payloads_total: AtomicU64,
-    pub(crate) sent_batches_total: AtomicU64,
-    pub(crate) sent_samples_total: AtomicU64,
-    pub(crate) sent_compressed_bytes_total: AtomicU64,
-    pub(crate) sent_uncompressed_bytes_total: AtomicU64,
-    pub(crate) replayed_batches_total: AtomicU64,
-    pub(crate) encoded_samples_total: AtomicU64,
-    pub(crate) encoded_compressed_bytes_total: AtomicU64,
-    pub(crate) encoded_uncompressed_bytes_total: AtomicU64,
-    pub(crate) request_duration_microseconds_total: AtomicU64,
-    pub(crate) last_request_duration_microseconds: AtomicU64,
-    pub(crate) pending_batches: AtomicUsize,
-    pub(crate) spool_bytes: AtomicU64,
-    pub(crate) oldest_ram_unixtime: AtomicU64,
-    pub(crate) oldest_spool_unixtime: AtomicU64,
-    pub(crate) last_success_unixtime: AtomicU64,
+struct Health {
+    attempts_total: AtomicU64,
+    failures_total: AtomicU64,
+    dropped_batches_total: AtomicU64,
+    rejected_payloads_total: AtomicU64,
+    sent_batches_total: AtomicU64,
+    sent_samples_total: AtomicU64,
+    sent_compressed_bytes_total: AtomicU64,
+    sent_uncompressed_bytes_total: AtomicU64,
+    replayed_batches_total: AtomicU64,
+    encoded_samples_total: AtomicU64,
+    encoded_compressed_bytes_total: AtomicU64,
+    encoded_uncompressed_bytes_total: AtomicU64,
+    request_duration_microseconds_total: AtomicU64,
+    last_request_duration_microseconds: AtomicU64,
+    pending_batches: AtomicUsize,
+    spool_bytes: AtomicU64,
+    oldest_ram_unixtime: AtomicU64,
+    oldest_spool_unixtime: AtomicU64,
+    last_success_unixtime: AtomicU64,
 }
 
 impl Health {
@@ -174,6 +207,7 @@ impl Health {
     }
 }
 
+/// Explicit configuration for an independently owned delivery worker.
 #[derive(Debug, Clone)]
 pub struct ClientBuilder {
     endpoint: String,
@@ -188,6 +222,7 @@ pub struct ClientBuilder {
 }
 
 impl ClientBuilder {
+    /// Configure an absolute HTTP or HTTPS ingestion endpoint.
     #[must_use = "the constructed client builder must be used"]
     pub fn new(endpoint: impl Into<String>) -> Self {
         Self {
@@ -203,30 +238,35 @@ impl ClientBuilder {
         }
     }
 
+    /// Add a default label to all samples; explicit sample labels take precedence.
     #[must_use = "the returned builder contains the new static label"]
     pub fn static_label(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.static_labels.push((name.into(), value.into()));
         self
     }
 
+    /// Set the timeout of each HTTP request.
     #[must_use = "the returned builder contains the new request timeout"]
     pub const fn timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
     }
 
+    /// Set the delay from a failed request to its next automatic attempt.
     #[must_use = "the returned builder contains the new retry interval"]
     pub const fn retry_interval(mut self, retry_interval: Duration) -> Self {
         self.retry_interval = retry_interval;
         self
     }
 
+    /// Set the delay before spilling the RAM backlog during an outage.
     #[must_use = "the returned builder contains the new spill delay"]
     pub const fn spill_after(mut self, spill_after: Duration) -> Self {
         self.spill_after = spill_after;
         self
     }
 
+    /// Enable disk spooling in an exclusive directory with a hard file-byte limit.
     #[must_use = "the returned builder contains the new spool configuration"]
     pub fn spool(mut self, directory: impl Into<PathBuf>, max_bytes: u64) -> Self {
         self.spool_dir = Some(directory.into());
@@ -296,6 +336,7 @@ impl ClientBuilder {
     }
 }
 
+/// Cloneable submission handle. All clones share the same bounded worker.
 #[derive(Debug, Clone)]
 pub struct Client {
     sender: Sender<worker::Command>,
@@ -350,28 +391,16 @@ impl Client {
         result
     }
 
-    pub(crate) fn series<I, K, V>(
-        &self,
-        name: &str,
-        labels: I,
-    ) -> Result<Arc<metric::Series>, Error>
+    fn series<I, K, V>(&self, name: &str, labels: I) -> Result<metric::Series, Error>
     where
         I: IntoIterator<Item = (K, V)>,
         K: Into<String>,
         V: Into<String>,
     {
-        Ok(Arc::new(metric::Series::new(
-            name,
-            labels,
-            &self.static_labels,
-        )?))
+        metric::Series::new(name, labels, &self.static_labels)
     }
 
-    pub(crate) fn submit_series(
-        &self,
-        series: Arc<metric::Series>,
-        value: f64,
-    ) -> Result<(), Error> {
+    fn submit_series(&self, series: metric::Series, value: f64) -> Result<(), Error> {
         self.enqueue(worker::Payload::Sample {
             series,
             value,
@@ -438,11 +467,13 @@ impl Client {
         Counter::new(self.clone(), name, labels)
     }
 
+    /// Read the current delivery health without contacting the worker.
     #[must_use = "the returned snapshot contains observed delivery health"]
     pub fn health(&self) -> HealthSnapshot {
         self.health.snapshot(&self.admission)
     }
 
+    /// Render health counters and gauges using a caller-supplied metric-name prefix.
     #[must_use = "the returned encoded metrics must be used"]
     pub fn health_prometheus(&self, prefix: &str) -> String {
         let health = self.health();
@@ -538,13 +569,13 @@ impl Client {
     }
 }
 
-pub(crate) fn lock<T>(mutex: &Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>, Error> {
+fn lock<T>(mutex: &Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>, Error> {
     mutex
         .lock()
         .map_err(|_| Error::State("mutex poisoned".into()))
 }
 
-pub(crate) fn unix_millis() -> u64 {
+fn unix_millis() -> u64 {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -552,7 +583,7 @@ pub(crate) fn unix_millis() -> u64 {
     u64::try_from(millis).unwrap_or(u64::MAX)
 }
 
-pub(crate) fn unix_seconds() -> u64 {
+fn unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()

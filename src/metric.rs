@@ -3,14 +3,14 @@ use std::sync::{Arc, Mutex};
 
 use crate::{Client, Error, lock};
 
-pub(crate) type Labels = Vec<(String, String)>;
+pub type Labels = Vec<(String, String)>;
 
 /// Validated and escaped metric selector. Handles share it across submissions.
-#[derive(Debug)]
-pub(crate) struct Series(Box<str>);
+#[derive(Debug, Clone)]
+pub struct Series(Arc<str>);
 
 impl Series {
-    pub(crate) fn new<I, K, V>(
+    pub(super) fn new<I, K, V>(
         name: &str,
         labels: I,
         static_labels: &[(String, String)],
@@ -41,23 +41,24 @@ impl Series {
             }
         }
         finish_labels(&mut selector, separator);
-        Ok(Self(selector.into_boxed_str()))
+        Ok(Self(selector.into()))
     }
 
-    pub(crate) fn as_str(&self) -> &str {
+    pub(super) fn as_str(&self) -> &str {
         &self.0
     }
 }
 
+/// Change-detecting gauge. Clones share the last admitted value.
 #[derive(Debug, Clone)]
 pub struct Gauge {
     client: Client,
-    series: Arc<Series>,
+    series: Series,
     last_bits: Arc<Mutex<Option<u64>>>,
 }
 
 impl Gauge {
-    pub(crate) fn new<I, K, V>(client: Client, name: &str, labels: I) -> Result<Self, Error>
+    pub(super) fn new<I, K, V>(client: Client, name: &str, labels: I) -> Result<Self, Error>
     where
         I: IntoIterator<Item = (K, V)>,
         K: Into<String>,
@@ -82,22 +83,23 @@ impl Gauge {
         if *last == Some(bits) {
             return Ok(false);
         }
-        self.client.submit_series(Arc::clone(&self.series), value)?;
+        self.client.submit_series(self.series.clone(), value)?;
         *last = Some(bits);
         drop(last);
         Ok(true)
     }
 }
 
+/// Process-local increasing counter. Clones share the accumulated value.
 #[derive(Debug, Clone)]
 pub struct Counter {
     client: Client,
-    series: Arc<Series>,
+    series: Series,
     value: Arc<Mutex<f64>>,
 }
 
 impl Counter {
-    pub(crate) fn new<I, K, V>(client: Client, name: &str, labels: I) -> Result<Self, Error>
+    pub(super) fn new<I, K, V>(client: Client, name: &str, labels: I) -> Result<Self, Error>
     where
         I: IntoIterator<Item = (K, V)>,
         K: Into<String>,
@@ -137,7 +139,7 @@ impl Counter {
         }
         // Admission and state commit share the same critical section; failed
         // admission cannot advance state and concurrent values remain ordered.
-        self.client.submit_series(Arc::clone(&self.series), next)?;
+        self.client.submit_series(self.series.clone(), next)?;
         *current = next;
         drop(current);
         Ok(next)
@@ -152,7 +154,7 @@ impl Counter {
     }
 }
 
-pub(crate) fn validate_labels(labels: &[(String, String)]) -> Result<(), Error> {
+pub fn validate_labels(labels: &[(String, String)]) -> Result<(), Error> {
     for (index, (key, _)) in labels.iter().enumerate() {
         validate_label_name(key)?;
         if labels[..index].iter().any(|(previous, _)| previous == key) {
@@ -164,7 +166,7 @@ pub(crate) fn validate_labels(labels: &[(String, String)]) -> Result<(), Error> 
     Ok(())
 }
 
-pub(crate) fn validate_metric_name(name: &str) -> Result<(), Error> {
+fn validate_metric_name(name: &str) -> Result<(), Error> {
     validate_identifier(name, true)
         .then_some(())
         .ok_or_else(|| Error::InvalidMetric(format!("invalid Prometheus metric name {name:?}")))
@@ -236,7 +238,9 @@ fn quoted_value(value: &str) -> Result<(&str, &str), Error> {
     Err(invalid_sample())
 }
 
-fn parse_text_labels(mut input: &str) -> Result<(Vec<(&str, &str)>, &str), Error> {
+type TextLabels<'a> = Vec<(&'a str, &'a str)>;
+
+fn parse_text_labels(mut input: &str) -> Result<(TextLabels<'_>, &str), Error> {
     let mut labels = Vec::new();
     loop {
         input = trim_horizontal(input);
@@ -323,7 +327,7 @@ fn render_text_line(
 
 /// Validate and render the entire snapshot before admission; never silently
 /// drop individual malformed lines or attach duplicate static labels.
-pub(crate) fn render_snapshot(
+pub fn render_snapshot(
     text: &str,
     static_labels: &[(String, String)],
     timestamp_ms: u64,
@@ -353,7 +357,7 @@ fn append_value(out: &mut String, value: f64) {
     }
 }
 
-pub(crate) fn render_sample(out: &mut String, series: &Series, value: f64, timestamp_ms: u64) {
+pub fn render_sample(out: &mut String, series: &Series, value: f64, timestamp_ms: u64) {
     out.push_str(series.as_str());
     out.push(' ');
     append_value(out, value);

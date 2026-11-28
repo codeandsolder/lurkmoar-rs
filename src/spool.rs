@@ -3,13 +3,13 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 const MAGIC: &[u8; 8] = b"LURKMR01";
-pub(super) const HEADER_BYTES: u64 = 8;
-pub(super) const FRAME_HEADER_BYTES: u64 = 4;
+pub const HEADER_BYTES: u64 = 8;
+pub const FRAME_HEADER_BYTES: u64 = 4;
 const LOCK_NAME: &str = ".lurkmoar.lock";
 const STAGING_NAME: &str = ".lurkmoar.tmp";
 
 #[derive(Debug)]
-pub(super) struct Store {
+pub struct Store {
     directory: PathBuf,
     // Advisory OS lock: released even after a process crash. Never unlink the
     // lock file, because another process could otherwise lock a different inode.
@@ -17,7 +17,7 @@ pub(super) struct Store {
 }
 
 #[derive(Debug)]
-pub(super) struct Entry {
+pub struct Entry {
     pub path: PathBuf,
     pub timestamp_ms: u64,
     sequence: u64,
@@ -51,9 +51,9 @@ impl Store {
         for entry in fs::read_dir(&self.directory)? {
             let entry = entry?;
             let path = entry.path();
-            if !path
+            if path
                 .extension()
-                .is_some_and(|extension| extension == "spool")
+                .is_none_or(|extension| extension != "spool")
             {
                 continue;
             }
@@ -129,7 +129,7 @@ fn file_key(path: &Path) -> io::Result<(u64, u64)> {
     ))
 }
 
-pub(super) fn encode<'a>(batches: impl IntoIterator<Item = &'a [u8]>) -> io::Result<Vec<u8>> {
+pub fn encode<'a>(batches: impl IntoIterator<Item = &'a [u8]>) -> io::Result<Vec<u8>> {
     let mut out = Vec::from(MAGIC.as_slice());
     for batch in batches {
         let len = u32::try_from(batch.len()).map_err(|_| {
@@ -145,11 +145,11 @@ pub(super) fn encode<'a>(batches: impl IntoIterator<Item = &'a [u8]>) -> io::Res
 }
 
 /// A malformed trailing frame does not erase the valid prefix of a file.
-pub(super) struct Frames<'a> {
+pub struct Frames<'a> {
     remaining: &'a [u8],
 }
 
-pub(super) fn decode(contents: &[u8]) -> io::Result<Frames<'_>> {
+pub fn decode(contents: &[u8]) -> io::Result<Frames<'_>> {
     let remaining = contents
         .strip_prefix(MAGIC)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad spool magic"))?;

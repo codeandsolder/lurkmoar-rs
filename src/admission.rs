@@ -6,13 +6,13 @@ use crate::Error;
 /// The reservation survives queueing, compression and the RAM outage queue.
 /// Delivery, durable spill or an explicitly recorded drop releases it.
 #[derive(Debug)]
-pub(super) struct Permit {
+pub struct Permit {
     _payload: OwnedSemaphorePermit,
     _bytes: OwnedSemaphorePermit,
 }
 
 #[derive(Debug)]
-pub(super) struct Admission {
+pub struct Admission {
     payloads: Arc<Semaphore>,
     bytes: Arc<Semaphore>,
     max_payloads: usize,
