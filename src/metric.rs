@@ -506,6 +506,7 @@ mod snapshot_tests {
         assert_eq!(client.health().outstanding_payloads, 1);
         drop(outstanding);
         assert!(gauge.set(2.0)?);
+        drop(gauge);
         drop(receiver.try_recv()?);
         assert_eq!(counter.inc()?.to_bits(), 1.0_f64.to_bits());
         assert_eq!(client.health().rejected_payloads_total, 2);

@@ -774,3 +774,99 @@ fn record_encoded(health: &Health, data: &Encoded) {
         .encoded_uncompressed_bytes_total
         .fetch_add(data.uncompressed_bytes, Ordering::Relaxed);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Command, Inbox, LIVE_MAX_PAYLOADS, REQUEST_TARGET_BYTES, encode_batch, inspect_gzip,
+    };
+    use crate::{Client, Error};
+    use std::sync::mpsc;
+
+    fn take_payload(inbox: &mut Inbox) -> Result<super::QueuedPayload, Box<dyn std::error::Error>> {
+        let command = match inbox.deferred.take() {
+            Some(command) => command,
+            None => inbox.receiver.try_recv()?,
+        };
+        match command {
+            Command::Payload(payload) => Ok(payload),
+            _ => Err("expected payload".into()),
+        }
+    }
+
+    #[test]
+    fn batching_preserves_fifo_barriers_and_count_limit() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (client, receiver) = Client::channel(Vec::new(), 256, 2 * REQUEST_TARGET_BYTES)?;
+        for _ in 0..=LIVE_MAX_PAYLOADS {
+            client.submit_prometheus_text("sample 1")?;
+        }
+        let (flush, waiter) = mpsc::sync_channel(1);
+        client.send(Command::Flush(flush))?;
+        client.submit_prometheus_text("after 2")?;
+        let mut inbox = Inbox {
+            receiver,
+            deferred: None,
+        };
+        let first = take_payload(&mut inbox)?;
+        let first = inbox.take_batch(first);
+        assert_eq!(first.len(), LIVE_MAX_PAYLOADS);
+        let encoded = encode_batch(first)?;
+        assert_eq!(
+            inspect_gzip(&encoded.data.gzip)?,
+            (encoded.data.uncompressed_bytes, LIVE_MAX_PAYLOADS as u64)
+        );
+        let second = take_payload(&mut inbox)?;
+        let second = inbox.take_batch(second);
+        assert_eq!(second.len(), 1);
+        let Some(Command::Flush(flush)) = inbox.deferred.take() else {
+            return Err("expected flush barrier".into());
+        };
+        flush.send(Ok(()))?;
+        waiter.recv()??;
+        let last = take_payload(&mut inbox)?;
+        assert_eq!(inbox.take_batch(last).len(), 1);
+        assert!(inbox.receiver.try_recv().is_err());
+        assert_eq!(client.health().outstanding_payloads, LIVE_MAX_PAYLOADS + 1);
+        drop(encoded);
+        drop(second);
+        assert_eq!(client.health().outstanding_payloads, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn batching_defers_payload_that_crosses_byte_target() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (client, receiver) = Client::channel(Vec::new(), 4, 4 * REQUEST_TARGET_BYTES)?;
+        let text = format!(
+            "sample{{label=\"{}\"}} 1",
+            "a".repeat(REQUEST_TARGET_BYTES / 2)
+        );
+        client.submit_prometheus_text(&text)?;
+        client.submit_prometheus_text(&text)?;
+        let mut inbox = Inbox {
+            receiver,
+            deferred: None,
+        };
+        let first = take_payload(&mut inbox)?;
+        assert_eq!(inbox.take_batch(first).len(), 1);
+        assert!(matches!(inbox.deferred, Some(Command::Payload(_))));
+        let second = take_payload(&mut inbox)?;
+        assert_eq!(inbox.take_batch(second).len(), 1);
+        assert_eq!(client.health().outstanding_payloads, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_submission_is_rejected_without_using_capacity() -> Result<(), Error> {
+        let (client, _receiver) = Client::channel(Vec::new(), 1, 1024)?;
+        let text = format!("sample{{label=\"{}\"}} 1", "a".repeat(1024));
+        assert!(matches!(
+            client.submit_prometheus_text(text),
+            Err(Error::PayloadTooLarge { .. })
+        ));
+        assert_eq!(client.health().outstanding_payloads, 0);
+        client.submit_prometheus_text("sample 1")?;
+        Ok(())
+    }
+}
