@@ -218,6 +218,7 @@ fn retry_interval_starts_after_failed_attempt_finishes()
         client.shutdown(),
         Err(lurkmoar::Error::Dropped { batches: 1 })
     ));
+    drop(client);
     Ok(())
 }
 
